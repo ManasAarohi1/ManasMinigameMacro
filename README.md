@@ -34,3 +34,12 @@ A macro that finds the watermelon in the Sol's RNG Summer event minigame.
 
 Join the Discord: https://discord.gg/oppression
 
+## Notes
+
+Average 40-60s completion with abyssal
+Average 60-80s completion with normal.
+
+Abyssal is more stable than normal.
+
+Abyssal is 95% accuracy in completion
+Normal is 80% accuracy in completion

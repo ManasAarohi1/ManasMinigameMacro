@@ -14,8 +14,6 @@ A macro that finds the watermelon in the Sol's RNG Summer event minigame.
 3. Set the options below, then press **Start** or **F1**.
 4. Press **F2** to stop.
 
-While it runs, leave Roblox in front and don't use the keyboard or mouse. The macro never sends keys to any other window, so if Roblox loses focus it holds off and tries to bring Roblox back.
-
 ## Settings
 
 | Setting | What it does |

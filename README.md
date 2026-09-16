@@ -43,3 +43,5 @@ Abyssal is more stable than normal.
 
 Abyssal is 95% accuracy in completion
 Normal is 80% accuracy in completion
+
+AI was utilized in the production of this macro.

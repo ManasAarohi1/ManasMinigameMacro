@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import winreg
 from ctypes import wintypes
@@ -44,8 +45,10 @@ DEFAULTS = {
     "ahk_path": "",           # AutoHotkey 1.1, if the search does not find it
     "private_server": "",
     "auto_reconnect": False,
-    "abyssal_mode": False,
+    "abyssal_mode": False,    # older setting, read once into speed_mode
+    "speed_mode": "",         # nonvip, vip or abyssal
     "low_end": False,
+    "rejoin_browser": False,
     "menu_key": "\\",         # Roblox's UI navigation toggle
 }
 
@@ -60,6 +63,13 @@ def load_settings():
     except (OSError, ValueError):
         pass
     return cfg
+
+
+def speed_mode(cfg):
+    mode = cfg.get('speed_mode')
+    if mode in ('nonvip', 'vip', 'abyssal'):
+        return mode
+    return 'abyssal' if cfg.get('abyssal_mode') else 'vip'
 
 
 def save_settings(cfg):
@@ -197,11 +207,13 @@ def follow(stop, log_dir=LOG_DIR, poll=1.0):
         while not stop():
             latest = newest_log(log_dir)
             if latest != path and latest is not None:
+                first = path is None
                 if handle:
                     handle.close()
                 path = latest
                 handle = open(path, "r", encoding="utf-8", errors="replace")
-                handle.seek(0, os.SEEK_END)
+                if first:       # a client started later is read from the top, so its first biome is not missed
+                    handle.seek(0, os.SEEK_END)
             line = handle.readline() if handle else None
             yield line or None
             if not line:
@@ -549,7 +561,6 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
 RELEASE = ('w', 'a', 's', 'd', 'q', 'e', 'f', 'Space')
 FOCUS_WAIT = 5           # s a script waits for Roblox to come forward before refusing to walk
 AHK_EXES = ('AutoHotkeyU64.exe', 'AutoHotkeyU32.exe', 'AutoHotkeyA32.exe', 'AutoHotkey.exe')
-_started = False
 
 
 def _version(path):
@@ -741,19 +752,47 @@ def menu_press_key(key=None):
     return key if len(key) == 1 else getattr(Key, key.lower(), key)
 
 
+WALK_PREFIX = 'path_'
+
+
+def our_walks():
+    """Every process running a walk script this program wrote, from this run or an earlier one."""
+    tmp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    out = []
+    for p in psutil.process_iter(['cmdline']):
+        try:
+            for arg in p.info['cmdline'] or ():
+                arg = os.path.normcase(os.path.abspath(arg))
+                if (arg.endswith('.ahk') and os.path.dirname(arg) == tmp
+                        and os.path.basename(arg).startswith(WALK_PREFIX)):
+                    out.append(p)
+                    break
+        except (psutil.Error, ValueError, OSError):
+            continue
+    return out
+
+
+def kill_walks():
+    """Kill leftover walks; other AutoHotkey scripts are left alone."""
+    for p in our_walks():
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+
+
 def start_walk(name, text=None):
-    """Begin walking; returns the process."""
-    global _started
+    """Begin walking (after killing any walk still running); returns the process."""
     exe = interpreter()
     if not exe:
         raise RuntimeError('AutoHotkey v1 not found; the paths are v1 syntax')
+    kill_walks()
     mark = os.path.join(tempfile.gettempdir(), 'ahk_go_%d.txt' % os.getpid())
     if os.path.exists(mark):
         os.remove(mark)
-    fd, tmp = tempfile.mkstemp(suffix='.ahk', prefix='path_', dir=tempfile.gettempdir())
+    fd, tmp = tempfile.mkstemp(suffix='.ahk', prefix=WALK_PREFIX, dir=tempfile.gettempdir())
     with os.fdopen(fd, 'w') as f:
         f.write(walk_script(name, mark, text))
-    _started = True
     proc = subprocess.Popen([exe, '/f', tmp], creationflags=NO_WINDOW)
     proc._tmp, proc._mark = tmp, mark
     return proc
@@ -781,6 +820,7 @@ def stop_walk(proc):
             except subprocess.TimeoutExpired:
                 proc.kill()
     finally:
+        kill_walks()
         release_all()
         for f in (proc._tmp, getattr(proc, '_mark', None)):
             try:
@@ -790,11 +830,8 @@ def stop_walk(proc):
 
 
 def stop_all(focus=True):
-    """Kill any AutoHotkey this program started, and let go of the keys."""
-    if _started:
-        for exe in AHK_EXES:
-            subprocess.call(['taskkill', '/F', '/IM', exe], stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    """Kill every walk this program started, and let go of the keys."""
+    kill_walks()
     release_all(focus=focus)
 
 
@@ -1062,18 +1099,18 @@ def walk_to_npc():
 
 
 def enter_round(ready=None):
-    """From anywhere to inside a round. Respawns and retries when no dialogue comes.
+    """From anywhere to inside a round. Respawns and retries when Lime does not answer.
     `ready` is asked before every try; False calls the entry off."""
     stop = solver.out_of_time
-    print('aligning the camera')
     bot = solver.Bot(quiet=True)
     for n in range(TRIES):
         if stop() or (ready is not None and not ready()):
             return False
         if n:
             slower()
-            print('no dialogue -- respawning, realigning and retrying (%d of %d)' % (n + 1, TRIES))
-        if not reset_and_align(stop):
+            print('no dialogue -- closing menus, respawning, realigning and retrying (%d of %d)' % (n + 1, TRIES))
+            close_guis()
+        if not reset_and_align(stop, align=bool(n)):     # a retry means the walk failed: align again
             return False
         paced(0.5)
         print('walking to the NPC')
@@ -1081,15 +1118,29 @@ def enter_round(ready=None):
             continue
         print('talking to it')
         bot.tap('e')
-        first = wait_for('[Minigame]')
-        if not first:
-            bot.tap('e')
-            first = wait_for('[Minigame]', timeout=2.5)
-        if first:
-            break
-    else:
-        screenshot('missed_entry.png')
-        print('   never saw the dialogue after %d tries' % TRIES)
+        if talk_to_lime(bot):
+            if close_inventory() and inventory_open():
+                close_guis()
+            return True
+    screenshot('missed_entry.png')
+    print('   could not start a round after %d tries' % TRIES)
+    return False
+
+
+def talk_to_lime(bot):
+    """Pick [Minigame] then the ticket: click mode's calibrated spots if both are set, else found by colour."""
+    points = load_points()
+    if all(name in points for name, _ in LIME_POINTS) and click_mode_on():
+        paced(LIME_WAIT_S)
+        press_point('minigame', settle=1.0)
+        press_point('ticket', settle=0.3)
+        return entered()
+    first = wait_for('[Minigame]')
+    if not first:
+        bot.tap('e')
+        first = wait_for('[Minigame]', timeout=2.5)
+    if not first:
+        print('   never saw the dialogue')
         return False
     click(first[0], first[1])
     paced(0.2)
@@ -1098,21 +1149,55 @@ def enter_round(ready=None):
         print('   the ticket prompt never came up')
         return False
     click(second[0], second[1])
+    entered()
+    return True
+
+
+def entered():
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < AFTER_TICKET * 2 * PACE:
         if in_round():
             time.sleep(0.3)
-            break
+            return True
         time.sleep(POLL)
-    close_inventory()
+    return False
+
+
+def close_guis():
+    """Open and close a menu with UI navigation, which shuts any GUI left open. Never stops half way."""
+    if solver.ABORT or not steady_front():
+        return False
+    print('   closing any open menu with UI navigation')
+    for step in CLOSE_GUIS:
+        if step is SETTLE:
+            paced(SETTLE_S)
+        else:
+            tap(step)
+    paced(SETTLE_S)
     return True
 
 
-def reset_and_align(stop):
-    """Respawn (which gives up first) and align."""
-    if click_mode_on():
-        return click_align(stop=stop)
-    return align_camera(stop=stop)
+LIME_POINTS = (('minigame', '[Minigame] button'), ('ticket', '[-1 Minigame Ticket]'))
+LIME_WAIT_S = 1.5        # after E, before the calibrated [Minigame] click
+CLOSE_GUIS = ([MENU_KEY, SETTLE] + [Key.up, Key.right] * 4 + [Key.up] * 2 + [Key.left] * 2
+              + [Key.enter, SETTLE, Key.enter, SETTLE, MENU_KEY])
+
+
+ALIGNED = False          # the camera was set this run; later entries only respawn
+
+
+def reset_and_align(stop, align=True):
+    """Respawn (which gives up first) and align the camera, or only respawn once it has been aligned."""
+    global ALIGNED
+    if not align and ALIGNED:
+        if stop():
+            return False
+        focus_roblox()
+        respawn()
+        paced(STEP_DELAY)
+        return True
+    ALIGNED = click_align(stop=stop) if click_mode_on() else align_camera(stop=stop)
+    return ALIGNED
 
 
 def find_give_up():
@@ -1197,11 +1282,19 @@ QUIET_S = 240.0          # no new log line for this long: frozen
 JOIN_S = 150.0
 READY_S = 90.0
 JOIN_SETTLE_S = 8.0
+PLAY_POINT = (("play", "Play button on the title screen"),)
+PLAY_PRESSES = 2        # Play clicks (found or calibrated) before the game counts as started
+PLAY_AFTER_S = 45.0     # after opening the private server, press the calibrated Play button this long later
 CLOSED_SETTLE_S = 2.0   # after Roblox has fully closed, before the deeplink opens a new one
-PLAY_BOX = (0.0, 0.7, 0.45, 1.0)
+PLAY_BOX = (0.0, 0.72, 0.4, 1.0)     # the title screen puts Play at the bottom left
+PLAY_RGB = (0x7e, 0xff, 0x91)        # its green
+PLAY_TOL = 30                        # red and blue may be off by this much at the green's brightness
 LOST = ('Lost connection with reason', 'Client has been disconnected with reason',
         'Disconnection Notification', 'ID_CONNECTION_LOST', 'leaveUGCGameInternal')
 JOINED = ('Connection accepted from', 'Replicator created for player')
+GAME_OUTPUT = '[FLog::Creator'
+FROZEN = 'frozen'
+REJOIN_GRACE_S = 30.0   # the game's own auto rejoin gets this long before the macro opens the server
 _GAME = tuple(re.compile(r'https?://(?:www\.)?roblox\.com/%s/(\d+)(?:/[^?\s]*)?'
                          r'(\?privateServerLinkCode=([a-zA-Z0-9]+))?' % kind, re.I)
               for kind in ('games', 'game-places'))
@@ -1234,20 +1327,25 @@ class Watch:
     def __init__(self, log_dir=None):
         self.log_dir = log_dir or LOG_DIR
         self.path, self.pos, self.tail = None, 0, ''
-        self.state, self.why, self.biome_seen = None, '', False
+        self.state, self.why = None, ''
         self.aura = None                      # last equipped aura the log reported
         self.aura_since = None
         self.in_menu = False                  # on the title screen
         self.fresh = time.time()              # when the log last grew
+        self._lock = threading.RLock()        # the connection thread and the round both poll
 
     def poll(self, now=None):
+        with self._lock:
+            return self._poll(now)
+
+    def _poll(self, now=None):
         now = time.time() if now is None else now
         newest = newest_log(self.log_dir)
         if newest is None:
             return self.state
         if newest != self.path:
             self.path, self.pos, self.tail = newest, 0, ''
-            self.state, self.why, self.biome_seen = None, '', False
+            self.state, self.why = None, ''
             self.aura, self.aura_since, self.in_menu = None, None, False
             self.fresh = now
         try:
@@ -1257,8 +1355,9 @@ class Watch:
             if size > self.pos:
                 with open(self.path, 'rb') as f:
                     f.seek(self.pos)
-                    data = f.read(size - self.pos)
-                self.pos, self.fresh = size, now
+                    data = f.read()
+                    self.pos = f.tell()
+                self.fresh = now
                 lines = (self.tail + data.decode('utf-8', 'replace')).split('\n')
                 self.tail = lines.pop()
                 for line in lines:
@@ -1271,13 +1370,13 @@ class Watch:
                         if aura is not None and aura != self.aura:
                             self.aura = aura
                             self.aura_since = time_from_line(line) or now
+                    if GAME_OUTPUT in line:         # game scripts (auras, the minigame) print here
+                        continue
                     if any(k in line for k in LOST):
                         if self.state != 'lost':
                             self.state, self.why = 'lost', _lost_reason(line)
                     elif any(k in line for k in JOINED):
                         self.state, self.why = 'joined', ''
-                    elif self.state == 'joined' and RPC_MARKER in line:
-                        self.biome_seen = True
         except OSError:
             pass
         return self.state
@@ -1299,7 +1398,7 @@ class Watch:
         if self.poll() == 'lost':
             return 'disconnected (%s)' % self.why
         if self.path and self.quiet_for() > quiet_s:
-            return 'no new Roblox log lines for %d minutes' % (quiet_s // 60)
+            return '%s: no new Roblox log lines for %d minutes' % (FROZEN, quiet_s // 60)
         return None
 
 
@@ -1313,14 +1412,23 @@ def roblox_running():
     return False
 
 
+def play_mask(rgb):
+    """Pixels that are the Play green (#7eff91), dimmed or anti-aliased down to 60% brightness."""
+    a = rgb.astype(np.int32)
+    g = a[..., 1]
+    k = g / 255.0
+    return ((g >= 150) & (np.abs(a[..., 0] - PLAY_RGB[0] * k) <= PLAY_TOL)
+            & (np.abs(a[..., 2] - PLAY_RGB[2] * k) <= PLAY_TOL))
+
+
 def find_play():
-    """Screen position of the green Play button on the title screen, or None."""
+    """Screen position of the green Play button on the title screen (centre of the biggest patch), or None."""
     box = client_box(PLAY_BOX)
-    h, s, v = hsv(grab(box))
-    ys, xs = np.nonzero((h >= 50) & (h <= 80) & (s >= 90) & (v >= 170))
-    if len(xs) < max(20, 150 * area_scale()):
+    found = _group(play_mask(grab(box)), (box[0], box[1]), 8, 40, max(20, 150 * area_scale()))
+    if not found:
         return None
-    return box[0] + int(np.median(xs)), box[1] + int(np.median(ys))
+    x, y, _ = found[0]
+    return int(x), int(y)
 
 
 def in_game(watch):
@@ -1328,16 +1436,32 @@ def in_game(watch):
     return watch.aura not in (None, '_None_') and not watch.in_menu
 
 
-def press_play(watch, stop=lambda: False, say=lambda m: None, timeout=90.0):
-    """Click Play while it is on screen, until the game has started. True once it has."""
+def calibrated_play(watch, due, say=lambda m: None):
+    """Once `due` (epoch s) has passed, press the calibrated Play button unless the game already started.
+    Returns (the next due time, whether it pressed): `due` while waiting, None once handled."""
+    if due is None or time.time() < due:
+        return due, False
+    if not in_game(watch) and 'play' in load_points():
+        say('pressing the calibrated Play button')
+        press_point('play', settle=1.0)
+        return None, True
+    return None, False
+
+
+def press_play(watch, stop=lambda: False, say=lambda m: None, timeout=90.0, play_due=None, presses=0):
+    """Click Play while it is on screen, at most PLAY_PRESSES times in all, then take the game as started.
+    True once it has."""
     end, gone, saved = time.time() + timeout, 0, False
     while time.time() < end and not stop():
         watch.poll()
-        at = find_play()
+        play_due, pressed = calibrated_play(watch, play_due, say)
+        presses += pressed
+        at = find_play() if presses < PLAY_PRESSES else None
         if at is not None:
             gone = 0
             say('pressing Play')
             click(*at)
+            presses += 1
         else:
             gone += 1
             if in_game(watch) or (watch.aura is not None and not watch.in_menu and gone >= 3):
@@ -1345,6 +1469,9 @@ def press_play(watch, stop=lambda: False, say=lambda m: None, timeout=90.0):
             if watch.in_menu and not saved:
                 saved = True
                 screenshot('title_screen.png')
+        if presses >= PLAY_PRESSES:
+            say('pressed Play %d times - taking the game as started' % presses)
+            return True
         time.sleep(3.0)
     return in_game(watch)
 
@@ -1379,40 +1506,114 @@ def close_roblox(wait=15.0):
         time.sleep(0.5)
 
 
-def rejoin(link, say=lambda m: None, stop=lambda: False, log_dir=None):
-    """Close Roblox, open the private server, wait until the game is talking. True if in."""
+BROWSERS = {'chrome.exe', 'msedge.exe', 'brave.exe', 'opera.exe', 'firefox.exe', 'vivaldi.exe', 'arc.exe',
+            'chromium.exe', 'librewolf.exe', 'waterfox.exe', 'floorp.exe', 'zen.exe', 'thorium.exe', 'browser.exe'}
+
+
+def window_title(hwnd):
+    buf = ctypes.create_unicode_buffer(512)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def browser_windows():
+    """{hwnd: title} of every visible browser window."""
+    pids = set()
+    for p in psutil.process_iter(['name']):
+        try:
+            if (p.info['name'] or '').lower() in BROWSERS:
+                pids.add(p.pid)
+        except psutil.Error:
+            continue
+    return {w.hwnd: window_title(w.hwnd) for w in mkey.get_all_windows() if w.pid in pids and w.status == 'visible'}
+
+
+def close_join_tabs(before):
+    """Ctrl+W on each browser window that turned to a Roblox page after the link was opened. How many it closed."""
+    closed = 0
+    for hwnd, title in browser_windows().items():
+        if 'roblox' not in title.lower() or before.get(hwnd) == title:
+            continue
+        if not force_foreground(hwnd):
+            continue
+        time.sleep(0.3)
+        if foreground_hwnd() != hwnd or 'roblox' not in window_title(hwnd).lower():
+            continue
+        with kb.pressed(Key.ctrl):
+            kb.press('w')
+            kb.release('w')
+        closed += 1
+        time.sleep(0.3)
+    return closed
+
+
+def came_back(log_dir, stop, wait):
+    """True once the newest log shows the client joined again and in game (the game's own auto rejoin)."""
+    end = time.time() + wait
+    while time.time() < end and not stop():
+        watch = Watch(log_dir)
+        watch.poll()
+        if watch.state == 'joined' and in_game(watch):
+            return True
+        time.sleep(3.0)
+    return False
+
+
+def rejoin(link, say=lambda m: None, stop=lambda: False, log_dir=None, browser=False, frozen=False):
+    """Open the private server again and wait until the game is talking. True if in.
+    Roblox is only closed by force when it is frozen; a new launch replaces a live client by itself."""
     target = deeplink(link)
     if not target:
         say('the private server link is not a Roblox link')
         return False
-    say('closing Roblox')
-    if not close_roblox():
-        say('Roblox would not fully close')
-        return False
-    time.sleep(CLOSED_SETTLE_S)
+    if browser:
+        target = link.strip()
     log_dir = log_dir or LOG_DIR
-    before = newest_log(log_dir)
+    if frozen:
+        say('Roblox is frozen - closing it')
+        if not close_roblox():
+            say('Roblox would not fully close')
+            return False
+        time.sleep(CLOSED_SETTLE_S)
+    elif roblox_running():
+        say('waiting for the game to rejoin by itself')
+        if came_back(log_dir, stop, REJOIN_GRACE_S):
+            say('the game rejoined by itself')
+            return True
+    watch = Watch(log_dir)
+    watch.poll()        # history is skipped; only what comes after the launch counts, in this log or a new one
+    watch.state, watch.why, watch.aura, watch.in_menu = None, '', None, False
     if stop():
         return False
-    say('opening the private server')
+    tabs = browser_windows() if browser else None
+    say('opening the private server%s' % (' in the browser' if browser else ''))
     os.startfile(target)
-    watch, t0, joined_at = Watch(log_dir), time.time(), None
+    t0, joined_at = time.time(), None
+    play_due, presses = t0 + PLAY_AFTER_S, 0
     while not stop():
         watch.poll()
         now = time.time()
-        if watch.path is not None and watch.path != before:
-            # Roblox logs leaveUGCGameInternal while handing a launch over to the server, before the join
-            if watch.state == 'lost' and (joined_at is not None or 'leaveUGCGameInternal' not in watch.why):
-                say('the new session was dropped too (%s)' % watch.why)
-                return False
-            if joined_at is None and watch.state == 'joined':
-                joined_at = now
-                say('joined - waiting for the game to load')
+        play_due, pressed = calibrated_play(watch, play_due, say)
+        presses += pressed
+        # Roblox logs leaveUGCGameInternal while handing a launch over to the server, before the join
+        if watch.state == 'lost' and (joined_at is not None or 'leaveUGCGameInternal' not in watch.why):
+            say('the new session was dropped too (%s)' % watch.why)
+            return False
+        if joined_at is None and watch.state == 'joined':
+            joined_at = now
+            say('joined - waiting for the game to load')
+            if tabs is not None:
+                try:
+                    if close_join_tabs(tabs):
+                        say('closed the browser tab')
+                        take_foreground(tries=2)
+                except Exception as e:
+                    say('could not close the browser tab (%s)' % e)
         if joined_at is None and now - t0 > JOIN_S:
             say('the new client never joined')
             return False
         if joined_at is not None and (watch.in_menu or watch.aura is not None or now - joined_at > READY_S):
-            if not in_game(watch) and not press_play(watch, stop, say):
+            if not in_game(watch) and not press_play(watch, stop, say, play_due=play_due, presses=presses):
                 say('the game did not start after pressing Play')
                 return False
             end = time.time() + JOIN_SETTLE_S

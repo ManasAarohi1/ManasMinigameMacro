@@ -1,4 +1,5 @@
 import ctypes
+import itertools
 import json
 import os
 import queue
@@ -29,7 +30,7 @@ SMALL_BUTTON = dict(bg=SUNK, fg=TEXT, activebackground=SUNK, activeforeground=AC
                     highlightthickness=1, highlightbackground=EDGE)
 
 TITLE = 'Manas Minigame Macro'
-VERSION = '1.0.0'
+VERSION = '1.1.1'
 RELEASES = (os.environ.get('MMM_UPDATE_URL')
             or 'https://api.github.com/repos/ManasAarohi1/ManasMinigameMacro/releases/latest')
 INVITE = 'https://discord.gg/oppression'
@@ -40,6 +41,7 @@ ENTER_WAITS = (5, 15, 30, 60, 120, 120)  # s between failed entries before the r
 REJOIN_AFTER = 3                        # missed entries in a row before auto reconnect rejoins
 REJOIN_WAITS = (30, 60, 120, 300, 300)
 WATCH_EVERY = 0.5
+CRASH_WAITS = (30, 60, 120, 300)        # s before a crashed run starts again (the last one repeats)
 AURA_BLIP_S = 3.0                       # another aura counts once the log has shown it this long
 STATS = game.STATS_FILE
 
@@ -67,8 +69,13 @@ EMBED_GOOD, EMBED_BAD, EMBED_INFO, EMBED_BIOME = 5763719, 15548997, 10921727, 58
 PING = {'GLITCHED', 'DREAMSPACE', 'CYBERSPACE'}
 
 
+def is_rare(name):
+    squashed = name.upper().replace(' ', '')
+    return any(p in squashed for p in PING)
+
+
 class BiomeWatcher:
-    """A biome change is an event; the biome already running at start and repeats inside the cooldown do not ping."""
+    """A biome change is an event; a rare one pings, even if it is already running at start, once per cooldown."""
 
     def __init__(self, cooldown=300.0):
         self.cooldown = cooldown
@@ -84,10 +91,10 @@ class BiomeWatcher:
         if name == self.current:
             return None
         now = time.time() if now is None else now
-        was_startup, self.started = self.started, False
+        self.started = False
         self.current = name
         last = self._last_alert.get(name)
-        alert = not was_startup and name in PING and (last is None or now - last >= self.cooldown)
+        alert = is_rare(name) and (last is None or now - last >= self.cooldown)
         if alert:
             self._last_alert[name] = now
         return name, alert
@@ -253,6 +260,68 @@ class Check(tk.Canvas):
                              fill=BG, width=2, capstyle='round', joinstyle='round')
 
 
+class Switch(tk.Canvas):
+    """A three-way switch; the highlight slides to the picked side."""
+    W, H, SLIDE_MS, STEP_MS = 72, 30, 180, 12
+
+    def __init__(self, parent, variable, options):
+        self.options = options
+        k = parent.winfo_fpixels('1i') / 96.0
+        self.w, self.h = int(self.W * k), int(self.H * k)
+        tk.Canvas.__init__(self, parent, width=self.w * len(options) + 2, height=self.h + 2, bg=PANEL,
+                           highlightthickness=0, bd=0, cursor='hand2')
+        self.var = variable
+        self.x = float(self._target())
+        self.hover = None
+        self._job = None
+        self.bind('<Button-1>', lambda e: self.var.set(self.options[self._at(e.x)][0]))
+        self.bind('<Motion>', lambda e: self._hover(self._at(e.x)))
+        self.bind('<Leave>', lambda e: self._hover(None))
+        self.var.trace_add('write', lambda *a: self._slide())
+        self._draw()
+
+    def _at(self, x):
+        return max(0, min(len(self.options) - 1, int((x - 1) // self.w)))
+
+    def _target(self):
+        keys = [k for k, _ in self.options]
+        value = self.var.get()
+        return 1 + self.w * (keys.index(value) if value in keys else 0)
+
+    def _hover(self, i):
+        if i != self.hover:
+            self.hover = i
+            self._draw()
+
+    def _slide(self):
+        if self._job is not None:
+            self.after_cancel(self._job)
+        start, end, t0 = self.x, self._target(), time.perf_counter()
+
+        def step():
+            f = min(1.0, (time.perf_counter() - t0) * 1000.0 / self.SLIDE_MS)
+            self.x = start + (end - start) * (1 - (1 - f) ** 3)
+            self._draw()
+            self._job = self.after(self.STEP_MS, step) if f < 1 else None
+        step()
+
+    def _pill(self, x0, y0, x1, y1, r, **kw):
+        pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+               x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _draw(self):
+        self.delete('all')
+        n, w, h = len(self.options), self.w, self.h
+        r = h // 2
+        self._pill(0, 0, n * w + 1, h + 1, r, fill=SUNK, outline=EDGE)
+        self._pill(self.x + 2, 3, self.x + w - 2, h - 2, r - 3, fill=ACCENT, outline=ACCENT)
+        picked = self._at(self.x + w / 2)
+        for i, (_, text) in enumerate(self.options):
+            colour = BG if i == picked else TEXT if i == self.hover else DIM
+            self.create_text(1 + w * i + w / 2, h / 2 + 1, text=text, fill=colour, font=(UIB, 9))
+
+
 def card(parent, **pack):
     f = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=EDGE, highlightcolor=EDGE)
     f.pack(**pack)
@@ -320,8 +389,8 @@ def load_rounds():
     return rows
 
 
-def round_stats(rows, since=0.0, now=None):
-    """Streaks, rates and times from the recorded rounds (oldest first)."""
+def round_stats(rows, since=0.0, now=None, hours=None):
+    """Streaks, rates and times from the recorded rounds (oldest first). `hours` is how long the macro ran."""
     now = time.time() if now is None else now
     got = [r for r in rows if r.get('got')]
     times = sorted(r['secs'] for r in got)
@@ -331,7 +400,8 @@ def round_stats(rows, since=0.0, now=None):
         best = max(best, streak)
     session = [r for r in rows if r['ts'] >= since]
     s_caught = sum(1 for r in session if r.get('got'))
-    hours = (now - session[0]['ts'] + session[0]['secs']) / 3600.0 if session else 0.0
+    if hours is None:
+        hours = (session[-1]['ts'] - session[0]['ts'] + session[0]['secs']) / 3600.0 if session else 0.0
     day = time.strftime('%Y-%m-%d', time.localtime(now))
     misses = {}
     for r in rows:
@@ -350,10 +420,12 @@ def round_stats(rows, since=0.0, now=None):
 class Calibrate(tk.Toplevel):
     """One row per button; Set hides this window and records the next click, which still reaches Roblox."""
 
-    def __init__(self, app):
+    def __init__(self, app, points=None):
         tk.Toplevel.__init__(self, app.root, bg=BG)
         self.app = app
-        self.points = game.POINTS + (game.AURA_POINTS if app.abyssal.get() else ())
+        self.only = points is not None          # just these buttons (the Play button); click mode is left alone
+        self.points = points or game.POINTS + game.LIME_POINTS + (game.AURA_POINTS if app.speed.get() == 'abyssal'
+                                                                  else ())
         self.capturing = None
         self.banner = None
         self.title('Calibrate click mode')
@@ -372,8 +444,10 @@ class Calibrate(tk.Toplevel):
         body = card(self, fill='both', expand=True, padx=22)
         self.rows = {}
         for i, (name, what) in enumerate(self.points):
-            if name == game.AURA_POINTS[0][0]:
-                tk.Label(body, text='Abyssal mode', bg=PANEL, fg=TEXT, font=(UIB, 11), anchor='w').pack(
+            heading = {game.AURA_POINTS[0][0]: 'Abyssal mode',
+                       game.LIME_POINTS[0][0]: 'Lime buttons (optional)'}.get(name) if not self.only else None
+            if heading:
+                tk.Label(body, text=heading, bg=PANEL, fg=TEXT, font=(UIB, 11), anchor='w').pack(
                     fill='x', padx=18, pady=(14, 2))
             elif i:
                 rule(body, 18)
@@ -412,7 +486,8 @@ class Calibrate(tk.Toplevel):
             done = name in stored
             tick.configure(text='✓' if done else '•', fg=GOOD if done else DIM)
             b.configure(text='Redo' if done else 'Set')
-        left = [n for n, _ in self.points if n not in stored]
+        optional = set() if self.only else {n for n, _ in game.LIME_POINTS}
+        left = [n for n, _ in self.points if n not in stored and n not in optional]
         self.done_b.configure(text='Done' if not left else 'Done  (%d still to set)' % len(left))
 
     def capture(self, name):
@@ -477,6 +552,10 @@ class Calibrate(tk.Toplevel):
 
     def finish(self):
         self._cancel()
+        if getattr(self, 'only', False):
+            self.app._cal_window = None
+            self.destroy()
+            return
         left = game.points_missing()
         if left:
             if messagebox.askyesno('Calibrate everything', 'Click mode needs every button set, %d still missing.\n\n'
@@ -529,7 +608,7 @@ class Stats(tk.Toplevel):
         self.refresh()
 
     def refresh(self):
-        s = round_stats(load_rounds(), since=self.app.opened)
+        s = round_stats(load_rounds(), since=self.app.opened, hours=self.app.hours_run())
         caught, seconds = self.app.caught, self.app.seconds
         fmt = lambda v, f: '-' if v is None else f(v)
         show = {'total': str(caught), 'avg': clock(seconds / caught) if caught else '-', 'today': str(s['today']),
@@ -562,7 +641,9 @@ class App:
         self.use_items = False
         self.server_link = ''
         self.reconnect_on = False
+        self.browser_rejoin = False
         self.abyssal_on = False
+        self.mode = 'vip'
         self.slow_pc = False
         self.need_rejoin = None     # why the client has to be rejoined
         self.rejoining = False
@@ -575,6 +656,8 @@ class App:
         self.cfg = game.load_settings()
         self.caught, self.seconds = load_stats()
         self.opened = time.time()
+        self.ran_s = 0.0            # time runs took this session; Per hour counts only this
+        self.run_began = None
         self._stats_window = None
         self.updating = False
 
@@ -665,10 +748,18 @@ class App:
         self._show_calibrator()
         self.click_mode.trace_add('write', self._click_mode_changed)
         rule(box)
-        self.auto_reconnect = self._toggle(box, 'Auto reconnect', 'rejoin the private server after a disconnect',
-                                           'auto_reconnect')
+        self.auto_reconnect = tk.BooleanVar(value=bool(self.cfg.get('auto_reconnect')))
+        row, _ = self._row(box, 'Auto reconnect', 'rejoin the private server after a disconnect; Set Play is clicked '
+                           '%d s after it opens' % game.PLAY_AFTER_S, lambda r: Check(r, self.auto_reconnect))
+        tk.Button(row, text='Set Play', command=lambda: self.calibrate(game.PLAY_POINT), padx=12,
+                  **SMALL_BUTTON).pack(side='right', padx=(12, 0))
         rule(box)
-        self.abyssal = self._toggle(box, 'Abyssal mode', 'Abyssal Hunter paths and auto re-equip', 'abyssal_mode')
+        self.rejoin_browser = self._toggle(box, 'Rejoin through browser', 'for PCs where the Roblox link does not open '
+                                           'the game: the private server opens in your browser instead', 'rejoin_browser')
+        rule(box)
+        self.speed = tk.StringVar(value=game.speed_mode(self.cfg))
+        self._row(box, 'Walk speed', 'Abyssal means Abyssal Hunter with VIP, and re-equips it',
+                  lambda r: Switch(r, self.speed, (('nonvip', 'Non-VIP'), ('vip', 'VIP'), ('abyssal', 'Abyssal'))))
         rule(box)
         self.menu_key = self._field(box, 'UI navigation key', str(self.cfg.get('menu_key') or '\\'),
                                     'the key that turns on UI navigation in Roblox')
@@ -756,7 +847,7 @@ class App:
             self._pending = self.root.after(800, self.remember)
 
         for var in (self.rounds, self.loop, self.giveup, self.auto_items, self.webhook, self.click_mode,
-                    self.auto_reconnect, self.server, self.abyssal, self.low_end, self.menu_key):
+                    self.auto_reconnect, self.server, self.speed, self.low_end, self.menu_key, self.rejoin_browser):
             var.trace_add('write', later)
 
     def remember(self):
@@ -769,7 +860,9 @@ class App:
                                 'webhook_url': self.webhook.get().strip(),
                                 'private_server': self.server.get().strip(),
                                 'auto_reconnect': bool(self.auto_reconnect.get()),
-                                'abyssal_mode': bool(self.abyssal.get()),
+                                'rejoin_browser': bool(self.rejoin_browser.get()),
+                                'speed_mode': self.speed.get(),
+                                'abyssal_mode': self.speed.get() == 'abyssal',
                                 'low_end': bool(self.low_end.get()),
                                 'menu_key': self.menu_key.get().strip() or '\\'})
         except Exception:
@@ -824,19 +917,19 @@ class App:
         else:
             self.calibrate()
 
-    def calibrate(self):
+    def calibrate(self, points=None):
         try:
             if game.find_roblox_window() is None:
                 raise RuntimeError('no Roblox window')
         except Exception:
             messagebox.showinfo(TITLE, 'Open Roblox first, then calibrate.')
-            if not game.points_ready():
+            if points is None and not game.points_ready():
                 self.click_mode.set(False)
             return
         if self._cal_window is not None and self._cal_window.winfo_exists():
             self._cal_window.lift()
             return
-        self._cal_window = Calibrate(self)
+        self._cal_window = Calibrate(self, points)
 
     # ----------------------------------------------------------- biome alerts
     def start_biomes(self, url):
@@ -930,7 +1023,9 @@ class App:
             return
         self.server_link = self.server.get().strip()
         self.reconnect_on = bool(self.auto_reconnect.get())
-        self.abyssal_on = bool(self.abyssal.get())
+        self.browser_rejoin = bool(self.rejoin_browser.get())
+        self.mode = self.speed.get()
+        self.abyssal_on = self.mode == 'abyssal'
         self.slow_pc = bool(self.low_end.get())
         if self.needs_calibration():
             return
@@ -1046,16 +1141,35 @@ class App:
             return None if self.reconnect_on else 'could not find the Roblox window - is the game open?'
         return None
 
+    def hours_run(self):
+        began = self.run_began
+        return (self.ran_s + (time.time() - began if began is not None else 0.0)) / 3600.0
+
     def _guard(self, n, limit):
+        """Run until Stop: a crash starts the run again after a wait."""
+        self.run_began = time.time()
         try:
-            self.play(n, limit)
-        except Exception as e:
-            try:
-                game.release_all()
-            except Exception:
-                pass
-            self.tell('Macro crashed', '%s: %s' % (type(e).__name__, e), EMBED_BAD)
+            for k in itertools.count():
+                try:
+                    self.play(n, limit)
+                    return
+                except Exception as e:
+                    try:
+                        game.release_all()
+                    except Exception:
+                        pass
+                    why = '%s: %s' % (type(e).__name__, e)
+                    note('crash', why)
+                    if solver.ABORT:
+                        self.tell('Macro crashed', why, EMBED_BAD)
+                        return
+                    wait = CRASH_WAITS[min(k, len(CRASH_WAITS) - 1)]
+                    self.tell('Macro crashed', '%s - starting again in %ds' % (why, wait), EMBED_BAD)
+                    if not self.nap(wait):
+                        return
         finally:
+            self.ran_s += time.time() - self.run_began
+            self.run_began = None
             self.running = False
             if self.biome_stop is not None:
                 self.biome_stop.set()
@@ -1071,9 +1185,10 @@ class App:
         return not solver.ABORT
 
     def get_in(self, head):
-        """Get into a round, retrying further apart each time; rejoins and re-equips on the way."""
-        misses = 0
-        for k in range(len(ENTER_WAITS) + 1):
+        """Get into a round, retrying further apart each time until Stop; rejoins and re-equips on the way."""
+        misses, k = 0, -1
+        while True:
+            k += 1
             if solver.ABORT:
                 return False
             if self.reconnect_on and not self.need_rejoin and not game.roblox_running():
@@ -1094,23 +1209,22 @@ class App:
                 self.aura_lost = self.aura_lost or rolled_away(self.watch)
                 if self.aura_lost and not self.reequip():
                     return False
-            if self.reconnect_on and misses % REJOIN_AFTER == 0:
+            if self.reconnect_on and misses % REJOIN_AFTER == 0 and not self.connected():
                 self.need_rejoin = 'no minigame button after %d entries' % misses
-            if k >= len(ENTER_WAITS):
-                return False
             if self.need_rejoin:
                 continue
-            note('connection', 'could not get in (%s), trying again in %ds' % (why, ENTER_WAITS[k]))
-            self._set(phase='%s - could not get in (%s), trying again in %ds' % (head, why, ENTER_WAITS[k]), colour=BAD)
-            if not self.nap(ENTER_WAITS[k]):
+            wait = ENTER_WAITS[min(k, len(ENTER_WAITS) - 1)]
+            note('connection', 'could not get in (%s), trying again in %ds' % (why, wait))
+            self._set(phase='%s - could not get in (%s), trying again in %ds' % (head, why, wait), colour=BAD)
+            if not self.nap(wait):
                 return False
-        return False
 
     def play(self, n, limit):
         solver.ABORT = False
+        game.ALIGNED = False
         game.PACE = 2.0 if self.slow_pc else 1.0
         self._set(phase='reading the path', colour=DIM)
-        solver.set_mode(self.abyssal_on)
+        solver.set_mode(self.mode)
         bot = solver.Bot(quiet=True)
         played = won = 0
         self.need_rejoin = None
@@ -1240,6 +1354,12 @@ class App:
                     self.aura_lost = rolled_away(watch)
             time.sleep(WATCH_EVERY)
 
+    def connected(self):
+        """The log shows the client joined and in game, so a missed entry is not a disconnect."""
+        watch = game.Watch()
+        watch.poll()
+        return game.roblox_running() and watch.state == 'joined' and game.in_game(watch)
+
     def ready_to_play(self):
         """Roblox open and connected. Play is only looked for after the macro itself rejoins."""
         watch = self.watch or game.Watch()
@@ -1253,19 +1373,23 @@ class App:
         return True
 
     def reconnect(self):
-        """Close Roblox and open the private server again. True if back in."""
+        """Open the private server again until it works or Stop is pressed (Roblox is only closed if frozen).
+        True if back in."""
         why, self.need_rejoin = self.need_rejoin, None
         if not (self.reconnect_on and game.deeplink(self.server_link)):
             return False
         note('connection', 'reconnecting: %s' % (why or ''))
         self.tell('Reconnecting', why or '', EMBED_BAD)
-        for k in range(len(REJOIN_WAITS) + 1):
+        k = -1
+        while True:
+            k += 1
             if solver.ABORT:
                 return False
             self.rejoining = True
             failed = ''
             try:
-                ok = game.rejoin(self.server_link, stop=lambda: solver.ABORT,
+                ok = game.rejoin(self.server_link, stop=lambda: solver.ABORT, browser=self.browser_rejoin,
+                                 frozen=(why or '').startswith(game.FROZEN),
                                  say=lambda m: (note('connection', m), self._set(phase='reconnecting - %s' % m, colour=DIM)))
             except Exception as e:
                 ok, failed = False, '%s: %s' % (type(e).__name__, e)
@@ -1274,19 +1398,16 @@ class App:
                 self.rejoining = False
             solver.clear_deadline()
             if ok:
+                game.ALIGNED = False
                 self.aura_lost = None
                 self.check_aura = self.abyssal_on
                 note('connection', 'rejoined')
                 self.tell('Rejoined the private server', '', EMBED_GOOD)
                 return True
-            if k == len(REJOIN_WAITS):
-                break
-            self.tell('Could not rejoin', '%strying again in %ds' % (failed + ' - ' if failed else '', REJOIN_WAITS[k]),
-                      EMBED_BAD)
-            if not self.nap(REJOIN_WAITS[k]):
+            wait = REJOIN_WAITS[min(k, len(REJOIN_WAITS) - 1)]
+            self.tell('Could not rejoin', '%strying again in %ds' % (failed + ' - ' if failed else '', wait), EMBED_BAD)
+            if not self.nap(wait):
                 return False
-        self.tell('Could not rejoin', 'gave up after %d tries' % (len(REJOIN_WAITS) + 1), EMBED_BAD)
-        return False
 
     def wearing_abyssal(self, wait=10.0):
         """Does the log say Abyssal Hunter is equipped? Waits a little for a first aura line."""
@@ -1363,6 +1484,7 @@ class App:
                     note('abyssal', 'attempt %d by %s crashed: %s: %s' % (attempt + 1, route, type(e).__name__, e))
                 note('abyssal', 'attempt %d by %s: steps %s' % (attempt + 1, route, 'done' if done else 'did not finish'))
                 if not done:
+                    self.close_guis()
                     continue
                 end = time.time() + 12.0
                 while time.time() < end and not solver.ABORT:
@@ -1374,6 +1496,7 @@ class App:
                         return True
                     time.sleep(0.5)
                 note('abyssal', 'attempt %d: the log still shows %s after 12 s' % (attempt + 1, self.watch.aura))
+                self.close_guis()
             # keep going without it: the normal paths fit the speed of whatever is on now
             note('abyssal', 'could not re-equip, switched to the normal paths')
             self.tell('Could not re-equip Abyssal Hunter', 'switched to the normal paths for the rest of the run', EMBED_BAD)
@@ -1392,6 +1515,7 @@ class App:
         except Exception as e:
             say('failed - %s: %s' % (type(e).__name__, e))
             self.tell('Auto SC + BR failed', '%s: %s' % (type(e).__name__, e), EMBED_BAD)
+            self.close_guis()
             return
         if len(got) == 2:
             self.tell('Used a Strange Controller and a Biome Randomizer')
@@ -1400,6 +1524,14 @@ class App:
             self.tell('Used a %s' % pretty(got[0]), "%s wasn't used" % pretty(missed), EMBED_INFO)
         else:
             self.tell('Auto SC + BR found nothing to use', '', EMBED_INFO)
+        if len(got) < 2:
+            self.close_guis()
+
+    def close_guis(self):
+        try:
+            game.close_guis()
+        except Exception as e:
+            note('menus', 'closing menus failed: %s: %s' % (type(e).__name__, e))
 
     def stop(self):
         solver.ABORT = True

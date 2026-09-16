@@ -18,14 +18,15 @@ DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data.npz')
 PX_PER_STUD = 1.8378
 BASE_SPEED = 16.0 * 1.25
 ABYSSAL_SPEED = 16.0 * 1.5 * 1.25
+NONVIP_SPEED = 16.0
+MODES = {'nonvip': NONVIP_SPEED, 'vip': BASE_SPEED, 'abyssal': ABYSSAL_SPEED}
+MODE = 'vip'
 SPEED = BASE_SPEED
 MS_PER_PX = 1000.0 / (SPEED * PX_PER_STUD)
 PROBE_AHK = 'probe.ahk'
-JUMP_EARLY_MS = 130     # Abyssal speed: jumps inside a leg take off this much sooner (about 3.9 studs)
-ABYSSAL_AFTER_JUMP = 823   # Abyssal holds S this long after the probe's first jump (normal keeps 523)
-
+JUMP_EARLY_MS = 130     # Abyssal speed: every jump takes off this much sooner; other speeds in proportion
+JUMP_LATE = True        # slower than VIP: jumps take off later in the same proportion
 DIR = {'w': (0, -1), 's': (0, 1), 'a': (-1, 0), 'd': (1, 0)}
-AFTER_JUMP = '    Send, {Space Up}' + chr(10) + '    Sleep, %d' + chr(10) + '    Send, {s Up}'
 _SEND = re.compile(r'\s*Send,?\s*\{(\w+)\s+(Down|Up)\}', re.I)
 _SLEEP = re.compile(r'\s*Sleep,?\s*(\d+)', re.I)
 _ALIGNED = re.compile(r';\s*aligned\s+([\d.]+)\s+([\d.]+)', re.I)
@@ -35,8 +36,6 @@ def walk_text(name):
     """A walk's AutoHotkey text, retimed for the current speed."""
     name = os.path.basename(name)
     text = WALKS[name]
-    if name == PROBE_AHK and SPEED != BASE_SPEED:
-        text = text.replace(AFTER_JUMP % 523, AFTER_JUMP % ABYSSAL_AFTER_JUMP)
     return text if name.endswith('_abyssal.ahk') else retime(text, BASE_SPEED / SPEED)
 
 
@@ -58,16 +57,55 @@ def retime(text, factor):
         if m and held & set(DIR):
             lines[i] = line[:m.start(1)] + str(max(1, round(int(m.group(1)) * factor))) + line[m.end(1):]
             scaled.add(i)
-    if factor < 1:
-        # faster: a jump covers more ground before its peak, so take off sooner (the Space hold gets the time)
-        for i, line in enumerate(lines):
-            m = _SEND.match(line)
-            if m and m.group(1).lower() == 'space' and m.group(2).lower() == 'down' and {i - 1, i + 1} <= scaled:
-                before, during = _SLEEP.match(lines[i - 1]), _SLEEP.match(lines[i + 1])
-                k = min(JUMP_EARLY_MS, int(before.group(1)) - 1)
-                lines[i - 1] = lines[i - 1][:before.start(1)] + str(int(before.group(1)) - k) + lines[i - 1][before.end(1):]
-                lines[i + 1] = lines[i + 1][:during.start(1)] + str(int(during.group(1)) + k) + lines[i + 1][during.end(1):]
+    shift = round(JUMP_EARLY_MS * (1 - factor) / (1 - BASE_SPEED / ABYSSAL_SPEED))
+    if shift > 0:
+        lines = _jump_sooner(lines, scaled, shift)
+    elif shift < 0 and JUMP_LATE:
+        lines = _jump_later(lines, -shift)
     return head + sep + '\n'.join(lines)
+
+
+def _jump_sooner(lines, walking, early):
+    """Faster, a jump covers more ground before its peak: every Space press moves `early` ms earlier
+    into the walking before it, into the leg before if needed. Total time is unchanged."""
+    rows = [[line, i in walking] for i, line in enumerate(lines)]
+    for row in [r for r in rows if _is_space_down(r[0])]:
+        at = next(i for i, r in enumerate(rows) if r is row)
+        prev = next((r for r in reversed(rows[:at]) if r[1]), None)
+        if prev is None:
+            continue
+        m = _SLEEP.match(prev[0])
+        k = min(early, int(m.group(1)) - 1)
+        if k <= 0:
+            continue
+        rows.pop(at)
+        p = next(i for i, r in enumerate(rows) if r is prev)
+        indent = prev[0][:len(prev[0]) - len(prev[0].lstrip())]
+        prev[0] = prev[0][:m.start(1)] + str(int(m.group(1)) - k) + prev[0][m.end(1):]
+        rows[p + 1:p + 1] = [row, ['%sSleep, %d' % (indent, k), True]]
+    return [r[0] for r in rows]
+
+
+def _jump_later(lines, late):
+    """Slower, a jump covers less ground before its peak: every Space press waits `late` ms of the walking
+    right after it. Total time is unchanged."""
+    out = list(lines)
+    i = 0
+    while i < len(out) - 1:
+        m = _SLEEP.match(out[i + 1]) if _is_space_down(out[i]) else None
+        k = min(late, int(m.group(1)) - 1) if m else 0
+        if k > 0:
+            indent = out[i + 1][:len(out[i + 1]) - len(out[i + 1].lstrip())]
+            out[i + 1] = out[i + 1][:m.start(1)] + str(int(m.group(1)) - k) + out[i + 1][m.end(1):]
+            out[i:i] = ['%sSleep, %d' % (indent, k)]
+            i += 1
+        i += 1
+    return out
+
+
+def _is_space_down(line):
+    m = _SEND.match(line)
+    return bool(m) and m.group(1).lower() == 'space' and m.group(2).lower() == 'down'
 
 
 def remainder(text, done_ms):
@@ -89,13 +127,15 @@ def remainder(text, done_ms):
     return 'RunPath()\n{\n' + '\n'.join(out) + '\n}\n'
 
 
-def set_mode(abyssal):
-    """Walk speed for this run: walk timings, the filter, the nav graph and the NPC walk."""
-    global SPEED, MS_PER_PX, FILE
-    SPEED = ABYSSAL_SPEED if abyssal else BASE_SPEED
+def set_mode(mode):
+    """Walk speed for this run ('nonvip', 'vip' or 'abyssal'; True and False mean abyssal and vip):
+    walk timings, the filter, the nav graph and the NPC walk."""
+    global SPEED, MS_PER_PX, FILE, MODE
+    MODE = 'abyssal' if mode is True else 'vip' if mode is False or mode not in MODES else mode
+    SPEED = MODES[MODE]
     MS_PER_PX = 1000.0 / (SPEED * PX_PER_STUD)
-    FILE = 'nav_abyssal.npz' if abyssal else 'nav.npz'
-    game.MINIGAME_AHK = 'lime_path_abyssal.ahk' if abyssal else 'lime_path.ahk'
+    FILE = 'nav_abyssal.npz' if MODE == 'abyssal' else 'nav.npz'
+    game.MINIGAME_AHK = 'lime_path_abyssal.ahk' if MODE == 'abyssal' else 'lime_path.ahk'
 
 
 def legs(text, with_keys=False):
@@ -1751,16 +1791,19 @@ WALKS = {
     Send, {a Up}
     Sleep, 30
     Send, {s Down}
-    Sleep, 2164
+    Sleep, 1200
     Send, {Space Down}
-    Sleep, 400
+    Sleep, 1800
     Send, {Space Up}
-    Sleep, 523
+    Sleep, 87
     Send, {s Up}
     Sleep, 30
     Send, {s Down}
     Send, {a Down}
-    Sleep, 1306
+    Send, {Space Down}
+    Sleep, 600
+    Send, {Space Up}
+    Sleep, 706
     Send, {s Up}
     Send, {a Up}
     Sleep, 30
@@ -1777,31 +1820,17 @@ WALKS = {
     Send, {Space Down}
     Sleep, 395
     Send, {Space Up}
-    Sleep, 1467
+    Sleep, 1005
     Send, {Space Down}
-    Sleep, 400
+    Sleep, 1000
     Send, {Space Up}
-    Sleep, 1656
+    Sleep, 1518
     Send, {s Up}
-    Send, {d Up}
-    Sleep, 30
-    Send, {d Down}
-    Sleep, 435
     Send, {d Up}
     Sleep, 30
     Send, {s Down}
-    Send, {d Down}
-    Sleep, 2177
+    Sleep, 2288
     Send, {s Up}
-    Send, {d Up}
-    Sleep, 30
-    Send, {d Down}
-    Sleep, 435
-    Send, {d Up}
-    Sleep, 30
-    Send, {d Down}
-    Sleep, 435
-    Send, {d Up}
     Sleep, 30
 }
 """,

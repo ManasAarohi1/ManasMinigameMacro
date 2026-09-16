@@ -6,7 +6,6 @@ A macro that finds the watermelon in the Sol's RNG Summer event minigame.
 
 - Windows
 - [AutoHotkey 1.1](https://www.autohotkey.com/download/1.1/)
-- VIP Gamepass
 ## How to use
 
 1. Open Sol's RNG and join a server (a private server is better).

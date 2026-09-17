@@ -30,7 +30,10 @@ SMALL_BUTTON = dict(bg=SUNK, fg=TEXT, activebackground=SUNK, activeforeground=AC
                     highlightthickness=1, highlightbackground=EDGE)
 
 TITLE = 'Manas Minigame Macro'
-VERSION = '1.1.1'
+VERSION = '1.2.0'
+UPDATE_TRIES = 4                        # startup update checks, in case the network is not up yet
+UPDATE_RETRY_S = 20
+RELEASE_PAGE = 'https://github.com/ManasAarohi1/ManasMinigameMacro/releases/latest'
 RELEASES = (os.environ.get('MMM_UPDATE_URL')
             or 'https://api.github.com/repos/ManasAarohi1/ManasMinigameMacro/releases/latest')
 INVITE = 'https://discord.gg/oppression'
@@ -41,6 +44,9 @@ ENTER_WAITS = (5, 15, 30, 60, 120, 120)  # s between failed entries before the r
 REJOIN_AFTER = 3                        # missed entries in a row before auto reconnect rejoins
 REJOIN_WAITS = (30, 60, 120, 300, 300)
 WATCH_EVERY = 0.5
+WAIT_BACK_S = 600                       # s to wait for Roblox to rejoin by itself when there is no link
+EQUIP_WAIT_S = 120                      # s to wait for the game before a re-equip
+EQUIP_GIVE_UP = 3                       # failed re-equips in a row before the run carries on without the aura
 CRASH_WAITS = (30, 60, 120, 300)        # s before a crashed run starts again (the last one repeats)
 AURA_BLIP_S = 3.0                       # another aura counts once the log has shown it this long
 STATS = game.STATS_FILE
@@ -211,6 +217,18 @@ def download(url, dest, size, progress=lambda f: None):
     if size and got != size:
         os.remove(dest)
         raise IOError('download cut short (%d of %d bytes)' % (got, size))
+
+
+def can_write(folder):
+    """Can this folder take the new exe? (Program Files and the like cannot, without asking for admin.)"""
+    probe = os.path.join(folder, '.mmm_write_test')
+    try:
+        with open(probe, 'wb') as f:
+            f.write(b'0')
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
 
 
 def install(new_exe, old_exe):
@@ -660,6 +678,7 @@ class App:
         self.run_began = None
         self._stats_window = None
         self.updating = False
+        self.pending_update = None
 
         root.title(TITLE)
         try:
@@ -749,10 +768,10 @@ class App:
         self.click_mode.trace_add('write', self._click_mode_changed)
         rule(box)
         self.auto_reconnect = tk.BooleanVar(value=bool(self.cfg.get('auto_reconnect')))
-        row, _ = self._row(box, 'Auto reconnect', 'rejoin the private server after a disconnect; Set Play is clicked '
+        row, text = self._row(box, 'Auto reconnect', 'rejoin the private server after a disconnect; Set Play is clicked '
                            '%d s after it opens' % game.PLAY_AFTER_S, lambda r: Check(r, self.auto_reconnect))
         tk.Button(row, text='Set Play', command=lambda: self.calibrate(game.PLAY_POINT), padx=12,
-                  **SMALL_BUTTON).pack(side='right', padx=(12, 0))
+                  **SMALL_BUTTON).pack(side='right', padx=(12, 0), before=text)
         rule(box)
         self.rejoin_browser = self._toggle(box, 'Rejoin through browser', 'for PCs where the Roblox link does not open '
                                            'the game: the private server opens in your browser instead', 'rejoin_browser')
@@ -902,6 +921,7 @@ class App:
             if now - self._last_hotkey.get(which, 0.0) < 0.75:     # a held key repeats
                 return True
             self._last_hotkey[which] = now
+            note('run', 'F%d pressed' % (1 if which == 'start' else 2))
             self.updates.put({'action': which})
         except Exception:
             pass
@@ -1009,6 +1029,8 @@ class App:
         elif kw.get('action') == 'idle':
             self.start_b.configure(state='normal')
             self.stop_b.configure(state='disabled')
+            if self.pending_update is not None:
+                self.root.after(500, lambda f=self.pending_update: self.offer_update(f))
 
     # ---------------------------------------------------------------- actions
     def start(self):
@@ -1064,37 +1086,73 @@ class App:
             self.calibrate()
 
     def check_update(self):
-        """Built exe only: a newer GitHub release offers to update; no internet or no release does nothing."""
+        """Built exe only: look for a newer GitHub release at startup. A check that fails (no network yet
+        when the macro opens) is tried again a few times, so the startup check is not lost."""
         if not getattr(sys, 'frozen', False):
+            note('update', 'not a built exe: no update check')
             return
 
         def run():
-            try:
-                found = latest_release()
-            except Exception:
+            note('update', 'checking for a new release (running %s)' % VERSION)
+            for attempt in range(UPDATE_TRIES):
+                if self._closing:
+                    return
+                try:
+                    found = latest_release()
+                except Exception as e:
+                    note('update', 'check failed (try %d of %d): %s: %s'
+                         % (attempt + 1, UPDATE_TRIES, type(e).__name__, e))
+                    for _ in range(int(UPDATE_RETRY_S / 2)):
+                        if self._closing:
+                            return
+                        time.sleep(2)
+                    continue
+                if not found:
+                    note('update', 'the newest release has no exe to download')
+                elif version_tuple(found[0]) > version_tuple(VERSION):
+                    note('update', 'version %s is out (running %s)' % (found[0], VERSION))
+                    self._set(update=found)
+                else:
+                    note('update', 'up to date (%s)' % VERSION)
                 return
-            if found and version_tuple(found[0]) > version_tuple(VERSION):
-                self._set(update=found)
         threading.Thread(target=run, daemon=True).start()
 
     def offer_update(self, found):
         tag, url, size = found
-        if self.running or self.updating:
+        if self.updating or version_tuple(tag) <= version_tuple(VERSION):
+            return
+        if self.running:            # mid-run: ask again once the run is over
+            self.pending_update = found
+            return
+        folder = os.path.dirname(sys.executable)
+        if not can_write(folder):
+            note('update', 'cannot write to %s: the update has to be downloaded by hand' % folder)
+            if messagebox.askyesno(TITLE, 'Version %s is out, but this folder cannot be written to:\n%s\n\n'
+                                   'Open the download page?' % (tag.lstrip('v'), folder), parent=self.root):
+                webbrowser.open(RELEASE_PAGE)
             return
         if not messagebox.askyesno(TITLE, 'Version %s is out (you have %s).\n\nUpdate now? The macro restarts by '
                                    'itself.' % (tag.lstrip('v'), VERSION), parent=self.root):
             return
         self.updating = True
+        self.pending_update = None
         self.start_b.configure(state='disabled')
         new = sys.executable + '.new'
 
         def run():
             try:
+                note('update', 'downloading %s' % url)
                 download(url, new, size, progress=lambda f: self._set(phase='downloading update %d%%' % round(100 * f)))
+                note('update', 'downloaded; swapping the exe and restarting')
                 install(new, sys.executable)
                 self._set(action='quit')
             except Exception as e:
+                note('update', 'failed: %s: %s' % (type(e).__name__, e))
                 self.updating = False
+                try:
+                    os.remove(new)
+                except OSError:
+                    pass
                 self._set(phase='update failed: %s' % e, colour=BAD, action='idle')
         threading.Thread(target=run, daemon=True).start()
 
@@ -1222,7 +1280,7 @@ class App:
     def play(self, n, limit):
         solver.ABORT = False
         game.ALIGNED = False
-        game.PACE = 2.0 if self.slow_pc else 1.0
+        game.set_pace(2.0 if self.slow_pc else 1.0)
         self._set(phase='reading the path', colour=DIM)
         solver.set_mode(self.mode)
         bot = solver.Bot(quiet=True)
@@ -1230,6 +1288,7 @@ class App:
         self.need_rejoin = None
         self.watch = None
         self.aura_lost = None
+        self.equip_fails = 0
         self.check_aura = self.abyssal_on
         solver.PAUSE = self if self.abyssal_on else None
         if self.reconnect_on or self.abyssal_on:
@@ -1260,6 +1319,7 @@ class App:
             began = time.perf_counter()
             solver.clear_deadline()
             if self.need_rejoin and not self.reconnect():
+                note('run', 'stopped: could not get back in after %d rounds' % (i - 1))
                 self.tell('Could not get into a round', 'stopped after %d rounds' % (i - 1), EMBED_BAD)
                 break
             if self.use_items and i == 1 and not solver.ABORT:
@@ -1276,8 +1336,10 @@ class App:
                 elif not wearing and rolled_away(self.watch):   # the 1 s _None_ a join or respawn shows is not a swap
                     self.aura_lost = self.aura_lost or aura
             if self.aura_lost and not self.reequip():
+                note('run', 'stopped: the re-equip could not finish')
                 break
             if not self.get_in(head):
+                note('run', 'stopped: could not get into a round after %d rounds' % (i - 1))
                 self.tell('Could not get into a round', 'stopped after %d rounds' % (i - 1), EMBED_BAD)
                 break
             played += 1
@@ -1327,6 +1389,7 @@ class App:
         solver.PAUSE = None
         game.stop_all()
         self._set(stats=1)
+        note('run', 'run ended: %d of %d rounds collected%s' % (won, played, ' (Stop pressed)' if solver.ABORT else ''))
         self.tell('Macro finished', '%d of %d rounds collected' % (won, played), EMBED_GOOD if won else EMBED_INFO)
 
     def _watch_connection(self):
@@ -1377,6 +1440,20 @@ class App:
         True if back in."""
         why, self.need_rejoin = self.need_rejoin, None
         if not (self.reconnect_on and game.deeplink(self.server_link)):
+            if not game.roblox_running():
+                note('connection', 'Roblox is not running and there is no rejoin link')
+                return False
+            note('connection', 'no rejoin link: waiting for the game to rejoin itself (%s)' % (why or ''))
+            self.tell('Disconnected', '%s - waiting for Roblox to rejoin by itself' % (why or ''), EMBED_BAD)
+            back = game.wait_back(stop=lambda: solver.ABORT, say=lambda m: note('connection', m), limit=WAIT_BACK_S)
+            if back:
+                note('connection', 'back in the game')
+                self.tell('Back in the game', '', EMBED_GOOD)
+                game.ALIGNED = False
+                self.watch = game.Watch()
+                self.check_aura = self.abyssal_on
+                return True
+            note('connection', 'the game did not come back in %ds' % WAIT_BACK_S)
             return False
         note('connection', 'reconnecting: %s' % (why or ''))
         self.tell('Reconnecting', why or '', EMBED_BAD)
@@ -1462,8 +1539,12 @@ class App:
             return game.ABYSSAL.lower() in (self.watch.aura or '').lower()
 
         if wearing():
-            self.aura_lost = None
+            self.aura_lost, self.equip_fails = None, 0
             return True
+        if self.watch is not None and not game.in_game(self.watch):    # mid-rejoin: the menus do not answer keys
+            note('abyssal', 'not in the game yet - waiting before re-equipping')
+            if not game.wait_back(stop=lambda: solver.ABORT, say=lambda m: note('abyssal', m), limit=EQUIP_WAIT_S):
+                return False
         rolled, self.equipping = self.aura_lost, True
         try:
             self.tell('New aura rolled', '%s replaced Abyssal Hunter - re-equipping' % rolled, EMBED_INFO)
@@ -1490,15 +1571,22 @@ class App:
                 while time.time() < end and not solver.ABORT:
                     self.watch.poll()
                     if game.ABYSSAL.lower() in (self.watch.aura or '').lower():
-                        self.aura_lost = None
+                        self.aura_lost, self.equip_fails = None, 0
                         self.tell('Abyssal Hunter re-equipped', '', EMBED_GOOD)
                         note('abyssal', 're-equipped: the log shows %s' % self.watch.aura)
                         return True
                     time.sleep(0.5)
                 note('abyssal', 'attempt %d: the log still shows %s after 12 s' % (attempt + 1, self.watch.aura))
                 self.close_guis()
+            self.equip_fails += 1
+            if self.equip_fails < EQUIP_GIVE_UP:
+                note('abyssal', 'could not re-equip (%d of %d): normal paths this round, trying again next round'
+                     % (self.equip_fails, EQUIP_GIVE_UP))
+                self.tell('Could not re-equip Abyssal Hunter', 'using the normal paths this round', EMBED_BAD)
+                solver.set_mode(False)
+                return True
             # keep going without it: the normal paths fit the speed of whatever is on now
-            note('abyssal', 'could not re-equip, switched to the normal paths')
+            note('abyssal', 'could not re-equip %d times, switched to the normal paths' % self.equip_fails)
             self.tell('Could not re-equip Abyssal Hunter', 'switched to the normal paths for the rest of the run', EMBED_BAD)
             self.abyssal_on, self.check_aura, self.aura_lost = False, False, None
             solver.PAUSE = None
@@ -1534,6 +1622,7 @@ class App:
             note('menus', 'closing menus failed: %s: %s' % (type(e).__name__, e))
 
     def stop(self):
+        note('run', 'Stop pressed')
         solver.ABORT = True
         if self.biome_stop is not None:
             self.biome_stop.set()

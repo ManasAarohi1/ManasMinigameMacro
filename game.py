@@ -201,20 +201,25 @@ def left_round(since, wait=2.0, log_dir=LOG_DIR):
 
 
 def follow(stop, log_dir=LOG_DIR, poll=1.0):
-    """Yield new log lines across client restarts; None on an idle poll."""
+    """Yield complete log lines written from now on, following the newest client log; None on an idle poll.
+    What a log already held is never read: the game repeats the current biome every few seconds."""
     path, handle = None, None
     try:
         while not stop():
             latest = newest_log(log_dir)
             if latest != path and latest is not None:
-                first = path is None
                 if handle:
                     handle.close()
                 path = latest
                 handle = open(path, "r", encoding="utf-8", errors="replace")
-                if first:       # a client started later is read from the top, so its first biome is not missed
-                    handle.seek(0, os.SEEK_END)
-            line = handle.readline() if handle else None
+                handle.seek(0, os.SEEK_END)
+            line = None
+            if handle:
+                at = handle.tell()
+                line = handle.readline()
+                if line and not line.endswith("\n"):     # still being written: read it whole next time
+                    handle.seek(at)
+                    line = None
             yield line or None
             if not line:
                 time.sleep(poll)
@@ -228,6 +233,8 @@ STEP_DELAY = 0.06
 SETTLE_S = 0.3           # menus, the reset prompt and a window coming to the front need a moment
 ROUND_EXIT_S = 2.5       # after a round ends, before a reset: keys sent while leaving the minigame are lost
 PACE = 1.0               # every paced wait is multiplied by this; Potato PC raises it
+ALIGNED = False          # the camera was set: entries only respawn until a Give up moves the character
+BASE_PACE = 1.0          # what PACE goes back to: a retry slows things down, an entry that works speeds them up
 ROBLOX_EXE = 'robloxplayerbeta.exe'
 
 u32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -236,6 +243,8 @@ VK = {'w': 0x57, 'a': 0x41, 's': 0x53, 'd': 0x44, 'q': 0x51, 'e': 0x45, 'f': 0x4
       ' ': 0x20, 'shift': 0xA0, 'ctrl': 0xA2, 'r': 0x52, 'enter': 0x0D, 'esc': 0x1B,
       '\\': 0xDC, 'oem5': 0xDC}
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+KEY_SC = {'w': 0x11, 'a': 0x1E, 's': 0x1F, 'd': 0x20, 'q': 0x10, 'e': 0x12, 'f': 0x21, 'r': 0x13,
+          ' ': 0x39, 'shift': 0x2A, 'ctrl': 0x1D, 'enter': 0x1C, 'esc': 0x01}   # where each key sits on any layout
 
 
 class KI(ctypes.Structure):
@@ -271,10 +280,23 @@ def paced(s):
     _sleep(s * PACE)
 
 
+def set_pace(base):
+    global PACE, BASE_PACE
+    BASE_PACE, PACE = base, base
+
+
 def slower():
     global PACE
     PACE = min(3.0, PACE + 0.5)
     print('   timings slowed to x%.1f' % PACE)
+
+
+def faster():
+    """An entry that worked: give back what the last retry took, down to the base pace."""
+    global PACE
+    if PACE > BASE_PACE:
+        PACE = max(BASE_PACE, PACE - 0.5)
+        print('   timings back to x%.1f' % PACE)
 
 
 MENU_KEY = 'ui navigation'   # stands for the key set in the window; tap() presses it
@@ -313,10 +335,10 @@ def wait_for_front(grace=3.0):
         time.sleep(0.05)
 
 
-def _send(vk, flags):
+def _send(vk, flags, sc=None):
     if not flags & KEYUP:
         wait_for_front()
-    sc = u32.MapVirtualKeyExW(vk, 0, _layout()) or u32.MapVirtualKeyW(vk, 0)
+    sc = sc or u32.MapVirtualKeyExW(vk, 0, _layout()) or u32.MapVirtualKeyW(vk, 0)
     inp = IN(type=1, ki=KI(wVk=0, wScan=sc, dwFlags=flags | SCANCODE, time=0, dwExtraInfo=0))
     if not u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -326,12 +348,12 @@ _down = set()
 
 
 def down(key):
-    _send(VK[key], 0)
+    _send(VK[key], 0, KEY_SC.get(key))
     _down.add(key)
 
 
 def up(key):
-    _send(VK[key], KEYUP)
+    _send(VK[key], KEYUP, KEY_SC.get(key))
     _down.discard(key)
 
 
@@ -343,9 +365,9 @@ def release_all(focus=True):
             time.sleep(0.15)
         except Exception:
             pass
-    for vk in VK.values():
+    for key, vk in VK.items():
         try:
-            _send(vk, KEYUP)
+            _send(vk, KEYUP, KEY_SC.get(key))
         except OSError:
             pass
         time.sleep(0.005)
@@ -558,7 +580,7 @@ def align_camera(stop=None):
 
 # ================================================================ AutoHotkey
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-RELEASE = ('w', 'a', 's', 'd', 'q', 'e', 'f', 'Space')
+RELEASE = ('w', 'a', 's', 'd', 'q', 'e', 'f', ' ')
 FOCUS_WAIT = 5           # s a script waits for Roblox to come forward before refusing to walk
 AHK_EXES = ('AutoHotkeyU64.exe', 'AutoHotkeyU32.exe', 'AutoHotkeyA32.exe', 'AutoHotkey.exe')
 
@@ -699,6 +721,19 @@ def interpreter():
     return found[0] if found else None
 
 
+_AHK_KEY = re.compile(r'\{(\w+)\s+(Down|Up)\}')
+
+
+def as_scancodes(text):
+    """Movement keys in a walk become scan codes: the same keys on QWERTY, AZERTY or anything else."""
+    def swap(m):
+        key = m.group(1).lower()
+        key = ' ' if key == 'space' else key
+        sc = KEY_SC.get(key)
+        return '{sc%03X %s}' % (sc, m.group(2)) if sc else m.group(0)
+    return _AHK_KEY.sub(swap, text)
+
+
 def walk_body(name, text=None):
     """The inside of a walk's RunPath()."""
     text = solver.walk_text(name) if text is None else text
@@ -718,7 +753,7 @@ def walk_body(name, text=None):
 
 def walk_script(name, marker=None, text=None):
     """The walk as a script that runs at once, only with Roblox in front, and stops if it loses focus."""
-    release = 'for i, k in ["%s"]' % '", "'.join(RELEASE)
+    release = 'for i, k in ["%s"]' % '", "'.join('sc%03X' % KEY_SC[k] for k in RELEASE)
     return '\n'.join([
         '#NoEnv', '#SingleInstance Force',
         'SendMode Input', 'SetKeyDelay, -1, -1', 'SetBatchLines, -1',
@@ -730,7 +765,7 @@ def walk_script(name, marker=None, text=None):
         'Sleep, 400',
         'SetTimer, FocusGuard, 100',
         ('FileAppend, go, %s' % marker) if marker else '',
-        walk_body(name, text),
+        as_scancodes(walk_body(name, text)),
         release,
         '    Send, {%k% Up}',
         'ExitApp, 0',
@@ -1121,6 +1156,7 @@ def enter_round(ready=None):
         if talk_to_lime(bot):
             if close_inventory() and inventory_open():
                 close_guis()
+            faster()
             return True
     screenshot('missed_entry.png')
     print('   could not start a round after %d tries' % TRIES)
@@ -1183,9 +1219,6 @@ CLOSE_GUIS = ([MENU_KEY, SETTLE] + [Key.up, Key.right] * 4 + [Key.up] * 2 + [Key
               + [Key.enter, SETTLE, Key.enter, SETTLE, MENU_KEY])
 
 
-ALIGNED = False          # the camera was set this run; later entries only respawn
-
-
 def reset_and_align(stop, align=True):
     """Respawn (which gives up first) and align the camera, or only respawn once it has been aligned."""
     global ALIGNED
@@ -1234,7 +1267,10 @@ def round_over():
 
 
 def give_up():
-    """Press Give up until the round is confirmed over. False if it could not be."""
+    """Press Give up until the round is confirmed over. False if it could not be.
+    Pressing the button means the camera is set again before the next entry: giving up moves the character.
+    The blind press below is not counted: it also happens on every respawn, when no round is on."""
+    global ALIGNED
     pressed = False
     now = time.perf_counter()
     look, end = now + GIVEUP_LOOK * PACE, now + GIVEUP_WAIT * PACE
@@ -1252,6 +1288,7 @@ def give_up():
             time.sleep(POLL)
             continue
         print('   pressing Give up')
+        ALIGNED = False
         if not click(found[0], found[1]):
             take_foreground()
             time.sleep(0.5)
@@ -1434,6 +1471,25 @@ def find_play():
 def in_game(watch):
     """A real aura in the log and not on the menu ('Equipped _None_' also shows on the title screen)."""
     return watch.aura not in (None, '_None_') and not watch.in_menu
+
+
+def wait_back(stop=None, say=lambda m: None, limit=600.0):
+    """Wait for the client to be in a game again: after a kick Roblox rejoins by itself. True if it came back."""
+    watch = Watch()
+    end = time.time() + limit
+    told = False
+    while time.time() < end:
+        if stop is not None and stop():
+            return False
+        if not roblox_running():
+            return False
+        watch.poll()
+        if watch.state == 'joined' and in_game(watch):
+            return True
+        if not told:
+            told, _ = True, say('waiting for the game to come back by itself')
+        paced(2.0)
+    return False
 
 
 def calibrated_play(watch, due, say=lambda m: None):

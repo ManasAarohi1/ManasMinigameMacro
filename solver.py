@@ -199,6 +199,12 @@ MODE_PX = 10.0
 STALL_HAZARD = 0.01
 STALL_S = 0.8
 POS_SD = 0.6
+STILL_AWARE = True       # what the screen says about moving is evidence of where it is, like the hint
+STILL_MISS = 0.3         # the screen says standing still: how likely that is for a particle walking freely
+MOVING_MISS = 0.65       # the screen says moving (or cannot tell): how likely for a particle held up by a wall
+STILL_FEW = 0.1          # standing still with less of the belief than this held up: it is not where it thinks,
+STILL_LOOKS = 2          # ...seen this many times running (tried once each time it stops),
+STILL_BACK = 4.0         # ...and it is held up somewhere it passed in the last few seconds
 EDGES = np.array([10.0, 20.0, 50.0, 80.0, 130.0])
 FLIP, FLIP_EDGE, EDGE, FLOOR = 0.04, 0.3, 2.0, 0.01
 FILE_STUDS = 2.0
@@ -336,6 +342,13 @@ def advance_bodies(x, z, f, y, vy, mx, mz, space):
     return done
 
 
+WATCH_KEYS = True        # a scripted walk is followed by the keys the keyboard really shows
+
+
+def _when(e):
+    return e[0]
+
+
 class Locator:
     def __init__(self, now, seed=0):
         w = world()
@@ -356,7 +369,9 @@ class Locator:
         self.L = np.zeros((N, self.S))            # log-likelihood of every spawn, per particle
         self.base = np.full(N, math.log(self.S))
         self.keys, self.space_until, self.sched = (), -1.0, None
+        self.seen, self._log = None, ()
         self.recent = np.zeros(N, bool)
+        self.went, self.stills = np.zeros(N, bool), 0
         self.press, self.filed, self._p = None, None, None
         self._n = 0
         self.hits = []
@@ -371,9 +386,12 @@ class Locator:
         self.advance()
         self.space_until = self.t + secs
 
-    def schedule(self, t0, text):
-        """An AutoHotkey walk starting at t0 drives the keys till it ends."""
+    def schedule(self, t0, text, seen=None):
+        """An AutoHotkey walk starting at t0 drives the keys till it ends. seen() -> [(when, keys down)] as the
+        keyboard really showed them: once it shows the walk, the belief goes by that and not by the script's
+        timetable, which a busy PC runs late."""
         self.advance(t0)   # up to the walk's start, only what was really held
+        self.seen, self._t0 = seen if WATCH_KEYS else None, t0
         ends, keys, t = [], [], t0
         for _, _, ms, held in legs(text, with_keys=True):
             t += ms / 1000.0
@@ -383,7 +401,7 @@ class Locator:
 
     def end_schedule(self):
         self.advance()
-        self.sched, self.keys = None, ()
+        self.sched, self.keys, self.seen, self._log = None, (), None, ()
 
     def pause_schedule(self, at, gap):
         if self.sched is None:
@@ -393,6 +411,23 @@ class Locator:
         if i < len(ends):
             self.sched = (ends[:i] + [at, at + gap] + [e + gap for e in ends[i:]],
                           keys[:i] + [keys[i], ()] + keys[i:])
+
+    def take_back(self, keys, secs):
+        """The game stood still for secs that the belief walked `keys`: walk that back."""
+        self.advance()
+        d = _dir(tuple(keys))
+        if d is None or secs <= 0:
+            return
+        sp = SPEED * self.spd * DT
+        mx = -(d[0] * self.ca - d[1] * self.sa) * sp
+        mz = -(d[0] * self.sa + d[1] * self.ca) * sp
+        for _ in range(int(round(secs / DT))):
+            advance_bodies(self.x, self.z, self.f, self.y, self.vy, mx, mz, False)
+        self._p = None
+
+    def keys_at(self, t):
+        self._log = self.seen() if self.seen is not None else ()
+        return self._keys_at(t)[0]
 
     def pressed(self):
         self.advance()
@@ -502,13 +537,13 @@ class Locator:
         jx, jz = tx + r * np.cos(a), tz + r * np.sin(a)
         return jx, jz, landing(jx, jz, tf + 3.0, 6.0)
 
-    def _inject(self, n):
+    def _inject(self, n, back=TRAIL_S):
         """Move the n least likely particles back onto the recent track, with a likely one's spawn evidence."""
         if n <= 0:
             return
         order = np.argsort(self.weights())
         low, donors = order[:n], order[-n:]
-        jx, jz, fl = self._near_trail(n, INJECT_STUDS, TRAIL_S)
+        jx, jz, fl = self._near_trail(n, INJECT_STUDS, back)
         ok = np.isfinite(fl)
         low, donors = low[ok], donors[ok]
         self.x[low], self.z[low], self.f[low] = jx[ok], jz[ok], fl[ok]
@@ -547,8 +582,23 @@ class Locator:
         """Did most of the belief move since last asked?"""
         self.advance()
         m = float(self.weights() @ self.recent)
+        self.went = self.recent.copy()
         self.recent[:] = False
         return m >= 0.5
+
+    def stood_still(self, still):
+        """What the screen said about moving while the keys were down. Standing still speaks for the particles
+        held up by something; with hardly any held up, some are put back on the recent track to be tried there."""
+        went = self.went
+        self.stills = self.stills + 1 if still else 0
+        if still:
+            if INJECT and self.trail and self.stills == STILL_LOOKS and float(self.weights() @ ~went) < STILL_FEW:
+                self._inject(int(round(INJECT * N)), STILL_BACK)
+            self.base[went] -= math.log(STILL_MISS)
+        else:
+            self.base[~went] -= math.log(MOVING_MISS)
+        self._p = None
+        self._resample_if_needed()
 
     def spawn_probs(self):
         if self._p is None:
@@ -570,6 +620,11 @@ class Locator:
         return float(wt @ self.x), float(wt @ self.z)
 
     def _keys_at(self, t):
+        log = self._log
+        if log and log[-1][0] >= self._t0 - 0.5 and self.sched is not None:
+            i = bisect.bisect_right(log, t, key=_when) - 1
+            k = log[i][1] if i >= 0 and log[i][0] >= self._t0 - 0.5 else ()
+            return k, ('space' in k) or t < self.space_until
         if self.sched is not None:
             ends, keys = self.sched
             i = bisect.bisect_right(ends, t)
@@ -580,6 +635,8 @@ class Locator:
 
     def advance(self, t=None):
         t = self.now() if t is None else t
+        if self.seen is not None:
+            self._log = self.seen()
         while self.t + DT <= t:
             self._step(*self._keys_at(self.t))
             self.t += DT
@@ -637,13 +694,77 @@ class Locator:
         self._p = None
 
 
+FREEZE_AWARE = True      # Roblox freezing (an FPS drop, a hitch) is told apart from walking into something
+FREEZE_MIN_S = 0.4       # shorter than this is a slow frame (a game at 3 frames a second still walks): left alone
+FREEZE_MAX_S = 4.0       # the longest a walk waits for the game to thaw, and the most ground it walks again
+FREEZE_POLL_MS = 50
+
+
 class Tracked:
-    """A bot whose keys, readings and E presses also feed a Locator. `odo` is the belief's."""
+    """A bot whose keys, readings and E presses also feed a Locator. `odo` is the belief's.
+    While Roblox is frozen the character stands still though the keys are down. A walk waits the freeze out
+    with its keys held, walks again the time the freeze ate, and the belief's clock leaves that time out."""
 
     def __init__(self, bot, seed=0):
-        clock = bot.now if hasattr(bot, 'now') else time.perf_counter
+        real = bot.now if hasattr(bot, 'now') else time.perf_counter
+        frz = {'lost': 0.0, 'last': 0.0, 'said': 0, 'stuck': 0}
+
+        def clock():
+            frz['last'] = max(frz['last'], real() - frz['lost'])     # never backwards: it stalls while lost catches up
+            return frz['last']
+
         object.__setattr__(self, '_b', bot)
+        object.__setattr__(self, '_real', real)
+        object.__setattr__(self, '_frz', frz)
         object.__setattr__(self, 'loc', Locator(clock, seed))
+
+    def _stalled(self, log, text, base):
+        """A leg the keyboard shows running long, through a gap in the macro's own looking: the whole PC stood,
+        the game with it, while the belief walked on. That walking is taken back."""
+        gaps = getattr(self._b, 'stalls', None)
+        done = self._frz.setdefault('legs', 0)
+        if gaps is None or len(log) < done + 2:
+            return
+        plan, t = [], 0.0
+        for _, _, ms, held in legs(text, with_keys=True):
+            plan.append((t, ms / 1000.0, tuple(sorted(held))))
+            t += ms / 1000.0
+        for i in range(done, len(log) - 1):
+            (a, keys), b = log[i], log[i + 1][0]
+            gap = sum(min(y, b) - max(x, a) for x, y in gaps(a) if x < b and y > a)
+            same = [p for p in plan if p[2] == tuple(sorted(keys))]
+            if gap >= FREEZE_MIN_S and same and set(keys) & set(DIR):
+                due = min(same, key=lambda p: abs(p[0] - (a - base)))[1]
+                late = (b - a) - due
+                if late >= gap / 2:
+                    self.loc.take_back(keys, min(gap, late, FREEZE_MAX_S))
+        self._frz['legs'] = len(log) - 1
+
+    def _thaw(self, keys, t0):
+        """After a hold that began at t0: wait out a freeze, then make up the ground it cost."""
+        look = getattr(self._b, 'freezes', None)
+        if not FREEZE_AWARE or look is None or not set(keys) & set(DIR) or self._frz['stuck'] >= 2:
+            return
+        waited, give_up = 0.0, self._real() + FREEZE_MAX_S
+        while self._real() < give_up and any(b is None for _, b in look(t0)):
+            self._b.hold(keys, FREEZE_POLL_MS)
+            waited += FREEZE_POLL_MS / 1000.0
+        now = self._real()
+        if now >= give_up:                              # a picture that never changes is a covered or minimised
+            self._frz['stuck'] += 1                     # window, not a freeze: twice, and freezes are left alone
+            if self._frz['stuck'] >= 2:
+                self._b.say('the screen is not changing - no longer waiting for freezes')
+            return
+        froze = sum(max(0.0, min(now if b is None else b, now) - max(a, t0)) for a, b in look(t0))
+        if froze < FREEZE_MIN_S:
+            return
+        froze = min(froze, FREEZE_MAX_S)
+        self._frz['lost'] += froze
+        self._frz['said'] += 1
+        if self._frz['said'] <= 5:
+            self._b.say('Roblox froze for %.1f s - walking that ground again' % froze)
+        if froze > waited:
+            self._b.hold(keys, (froze - waited) * 1000.0)
 
     @property
     def __class__(self):
@@ -664,13 +785,19 @@ class Tracked:
         return self.loc.now()
 
     def hold(self, keys, ms):
+        if ABORT or CUT:
+            raise CutShort
         if PAUSE is not None and PAUSE.pause_pending():
             self.loc.set_keys(())
             self._b.let_go()
             PAUSE.pause_run()
         keys = tuple(keys)
+        if keys and hasattr(self._b, 'settle'):
+            self._b.settle()                            # standing out an E is not walking
         self.loc.set_keys(keys)
+        t0 = self._real()
         self._b.hold(keys, ms)
+        self._thaw(keys, t0)
 
     def release(self):
         self.loc.set_keys(())
@@ -681,14 +808,21 @@ class Tracked:
         self._b.let_go()
 
     def tap(self, key):
+        if ABORT or CUT:
+            raise CutShort
         if key == ' ':
             self.loc.jump(0.04)
-        if self._b.tap(key) is not False and key == 'e':
+        if self._e(key, 0.04, self._b.tap) is not False and key == 'e':
             self.loc.pressed()
 
     def stab(self, key):
-        if self._b.stab(key) is not False and key == 'e':
+        if self._e(key, STAB_S, self._b.stab) is not False and key == 'e':
             self.loc.pressed()
+
+    def _e(self, key, secs, press):
+        if key == 'e' and hasattr(self._b, 'press_e'):
+            return self._b.press_e(secs, self.loc.set_keys)
+        return press(key)
 
     def look(self):
         self.loc.set_keys(())
@@ -700,19 +834,35 @@ class Tracked:
             self.loc.saw(h)
         return h
 
-    def moving(self):
-        return self.loc.moving() and self._b.moving()
+    def moving(self, quick=False):
+        """quick: a look at the screen that takes no time out of the step, where the bot has one."""
+        if not self.loc.moving():
+            return False
+        look = getattr(self._b, 'glance', None) if quick else None
+        seen = (look or self._b.moving)()
+        frozen = getattr(self._b, 'freezes', None)
+        if STILL_AWARE and not (frozen and frozen(self._real() - 1.0)):
+            self.loc.stood_still(not seen)
+        return seen
 
     def walk(self, legs, ahk_file=None):
         text = walk_text(ahk_file) if ahk_file else None
         gen = self._b.walk(legs, ahk_file)
         base = None
+        look, seen_to = getattr(self._b, 'freezes', None) if FREEZE_AWARE else None, self._real()
+        keys_seen = getattr(self._b, 'keys_seen', None)
         try:
             for t in gen:
+                for a, b in (look(seen_to) if look else ()):      # the script walks on through a freeze
+                    if b is not None and b > seen_to and b - a >= FREEZE_MIN_S:
+                        self.loc.take_back(self.loc.keys_at(a), min(b - max(a, seen_to), FREEZE_MAX_S))
+                        seen_to = b
+                if base is not None and keys_seen is not None and FREEZE_AWARE:
+                    self._stalled(keys_seen(), text, base)
                 now = self.loc.now()
                 if base is None and text is not None:
                     base = now - t
-                    self.loc.schedule(base, text)
+                    self.loc.schedule(base, text, keys_seen)
                 elif base is not None and PAUSE is not None and now - t - base > 0.5:
                     gap = now - t - base
                     self.loc.pause_schedule(now - gap, gap)
@@ -938,16 +1088,19 @@ BACKOFF_MS = 60          # step back off a wall before a new direction
 JUMP_EVERY = 1000
 SLIDE = (1, -1, 2, -2)   # 45-degree turns to try when blocked
 COLLECT_TIER = 4         # "very close": press E while walking
-REACH_TIER = 3
+REACH_TIER = 4           # E is only pressed where it can reach: every press costs a stop (STILL_S)
 STAB_S = 0.012           # a press with no dwell
 CLOSE_SLICE_MS = 100
 GONE_SAMPLES = 5         # blank reads in a row before believing the hint has gone
-COLLECT_TAPS = 30
-NEAR_TAPS = 12
+COLLECT_TAPS = 12        # standing still never brings E into reach or into view: press a little, then move
+NEAR_TAPS = 6
 COLLECT_GAP = 0.10
 E_GAP_S = 0.25           # at least this long between E presses: spamming E gets players kicked
+WALK_E_GAP_S = 0.9       # and this long between the ones that interrupt a walk
+STILL_S = 0.3            # the game kicks for collecting on the move: the keys are up this long before E goes down
+AFTER_S = 0.3            # ...and stay up this long after it: the server hears of the E a moment later
 FINISH_RIDE_MS = 500     # keep walking the arrival heading while the hint does not drop
-COLLECT_NUDGE = 6
+COLLECT_NUDGE = 3
 PATH_TRIES = 3
 
 DEADLINE = None
@@ -965,13 +1118,25 @@ class Collected(Exception):
     pass
 
 
+CUT = False              # the game was lost: the round ends where it stands
+
+
+class CutShort(Exception):
+    """Stop was pressed or the game was lost: nothing more is walked or pressed in this round."""
+
+
+def cut_short():
+    global DEADLINE, CUT
+    CUT, DEADLINE = True, time.perf_counter()
+
+
 def out_of_time():
     return ABORT or (DEADLINE is not None and time.perf_counter() >= DEADLINE)
 
 
 def start_clock(seconds):
-    global DEADLINE, ABORT
-    ABORT = False
+    global DEADLINE, ABORT, CUT
+    ABORT = CUT = False
     DEADLINE = None if not seconds else time.perf_counter() + float(seconds)
 
 
@@ -1109,9 +1274,24 @@ def collected(bot):
         return True
 
 
-def finish(bot, taps=COLLECT_TAPS):
-    """Press E until the hint goes. True if collected."""
-    bot.say('%s - collecting' % TIERS[min(5, bot.best_band)])
+def zoom_in(bot):
+    """Beside it and E is not taking: zoom all the way in and only a little back out, once a round."""
+    if getattr(bot, 'zoomed', False) or not hasattr(bot, 'zoom_close'):
+        return
+    bot.zoomed = True
+    bot.say('E is not taking - zooming in closer')
+    bot.zoom_close()
+
+
+def finish(bot):
+    """Press E until the hint goes. True if collected. Goes by what the hint reads here and now:
+    under "very close" E cannot reach, so there is no pressing at all."""
+    seen = [h for h in (bot.peek(), bot.peek()) if h is not None]
+    if seen and max(seen) < COLLECT_TIER:
+        bot.say('reads %s here - too far for E, moving on' % TIERS[max(seen)])
+        return False
+    taps = COLLECT_TAPS if seen and max(seen) >= 5 else NEAR_TAPS
+    bot.say('%s - collecting' % TIERS[max(seen)] if seen else 'no hint - collecting')
     keys = tuple(bot.held)
     if keys in DIRS and FINISH_RIDE_MS > 0:
         d, best, left = DIRS.index(keys), bot.peek(), FINISH_RIDE_MS
@@ -1136,6 +1316,7 @@ def finish(bot, taps=COLLECT_TAPS):
             bot.say('the hint is gone - collected')
             return True
         if i % COLLECT_NUDGE == COLLECT_NUDGE - 1:
+            zoom_in(bot)
             bot.tap(' ')
             for _ in range(3):
                 bot.wait(0.08)
@@ -1145,6 +1326,9 @@ def finish(bot, taps=COLLECT_TAPS):
                 return True
             move(bot, (i // COLLECT_NUDGE) * 2 % 8, 250)
             bot.release()
+            h = bot.peek()
+            if h is not None and h < COLLECT_TIER:
+                break
     bot.say('still showing a hint - not collected, carrying on')
     return False
 
@@ -1158,6 +1342,7 @@ def new_round(bot):
     global ROUND_T0, _unconfirmed
     ROUND_T0, _unconfirmed = time.time(), None
     bot.facing, bot.since_jump, bot.slide, bot.best_band = None, 0, 1, -1
+    bot.zoomed = False
     bot.motion.forget()
 
 
@@ -1169,6 +1354,9 @@ def play_round(bot):
     except Collected:
         bot.say('the hint is gone - collected')
         return True
+    except CutShort:
+        bot.say('the round was cut short')
+        return False
     finally:
         try:
             bot.let_go()
@@ -1179,11 +1367,11 @@ def play_round(bot):
 _last_e = 0.0
 
 
-def e_ready(now=None):
+def e_ready(now=None, walking=False):
     """True (and the wait starts again) if an E press is allowed now."""
     global _last_e
     now = time.perf_counter() if now is None else now
-    if now - _last_e < E_GAP_S:
+    if now - _last_e < (WALK_E_GAP_S if walking else E_GAP_S):
         return False
     _last_e = now
     return True
@@ -1196,6 +1384,7 @@ class Bot:
         game.arm()
         self.motion = game.Motion()
         self.held = ()
+        self.stopped_at = self.e_at = 0.0
         self.facing, self.since_jump, self.slide, self.best_band = None, 0, 1, -1
         self.on_slice = None
         self.quiet = quiet
@@ -1207,7 +1396,13 @@ class Bot:
         elif not self.quiet:
             print(msg)
 
+    def settle(self):
+        """Walking on straight after an E would look like collecting on the move."""
+        time.sleep(max(0.0, AFTER_S - (time.perf_counter() - self.e_at)))
+
     def hold(self, keys, ms):
+        if keys and not self.held:
+            self.settle()
         for k in keys:
             if k not in self.held:
                 game.down(k)
@@ -1220,7 +1415,31 @@ class Bot:
     def release(self):
         for k in self.held:
             game.up(k)
+        if self.held:
+            self.stopped_at = time.perf_counter()
         self.held = ()
+
+    def press_e(self, secs, on_keys=None):
+        """E from a standstill: the walk keys come up, the character gets STILL_S to stop, E, AFTER_S more, and
+        the walk goes on. on_keys hears which keys are down, so the standing is not counted as walking.
+        (A jump does not count as moving.)"""
+        if not e_ready(walking=bool(self.held)):
+            return False
+        keys = self.held
+        self.release()
+        if keys and on_keys:
+            on_keys(())
+        time.sleep(max(0.0, STILL_S - (time.perf_counter() - self.stopped_at)))
+        game.down('e')
+        time.sleep(max(secs, game.freeze_watch().frame_s()))
+        game.up('e')
+        self.e_at = time.perf_counter()
+        if keys:
+            self.settle()
+            if on_keys:
+                on_keys(keys)
+            self.hold(keys, 0)
+        return True
 
     def let_go(self):
         self.release()
@@ -1229,12 +1448,20 @@ class Bot:
     def moving(self):
         return self.motion.moving()
 
+    def glance(self):
+        return self.motion.moving(pad=False)
+
+    def zoom_close(self):
+        game.zoom_close()
+        self.motion.forget()
+
     def in_round(self):
         return game.in_round()
 
     def walk(self, legs, ahk_file):
         """AutoHotkey walks the path; yields seconds walked. Retried if it never sets off."""
         proc = game.start_walk(ahk_file)
+        self.key_watch = game.KeyWatch()
         try:
             for attempt in range(PATH_TRIES):
                 if game.walking(proc) or proc.poll() is None:
@@ -1264,24 +1491,34 @@ class Bot:
                     t0 = time.perf_counter() - walked
                 yield time.perf_counter() - t0
         finally:
+            self.key_watch.stop()
             game.stop_walk(proc)
 
     def wait(self, seconds):
         time.sleep(seconds)
 
+    def freezes(self, since):
+        return game.freeze_watch().windows(since)
+
+    def keys_seen(self):
+        return self.key_watch.log if getattr(self, 'key_watch', None) else []
+
+    def stalls(self, since):
+        return [g for g in self.key_watch.gaps if g[1] >= since] if getattr(self, 'key_watch', None) else []
+
     def tap(self, key):
-        if key == 'e' and not e_ready():
-            return False
+        if key == 'e':
+            return self.press_e(0.04)
         game.down(key)
-        time.sleep(0.04)
+        time.sleep(max(0.04, game.freeze_watch().frame_s()))
         game.up(key)
         return True
 
     def stab(self, key):
-        if key == 'e' and not e_ready():
-            return False
+        if key == 'e':
+            return self.press_e(STAB_S)
         game.down(key)
-        time.sleep(STAB_S)
+        time.sleep(max(STAB_S, game.freeze_watch().frame_s()))
         game.up(key)
         return True
 
@@ -1312,13 +1549,15 @@ HOT_KEEP = True          # a trip whose hint got closer is not dropped for a "be
 RING_TIER = 3            # a reading this close pins the search round there
 INREACH_FROM = 3         # "right in front of me" stops the walk after an agreed reading this close,
 INREACH_REPEAT = 3       # ...or this many in a row
+INREACH_AGREE = 2        # and never on one reading alone: scenery behind the hint can look like the phrase
+RING_KEEP = True         # False: a ring whose spawns were all stood on is kept anyway (as before 1.2.13)
 LOST_STUDS = 6.0         # the belief is lost: scatter it this far...
 LOST_BACK = 30.0         # ...round anywhere it was this many seconds back
 SEARCH_OUT_MS = 600
 SEARCH_ARM_MAX = 1000
 CLIMBS = 3               # times a closer reading can move the search centre
 HOT_SEARCHES = 2         # searches where it read close before a trip may leave that ring
-COLLECT_TRIES = 30
+COLLECT_TRIES = 4
 REACH_PUSH_MS = 400
 NAV_LEG_PX = 40.0
 NAV_STALL = 6            # legs without getting nearer: give that spawn up for now
@@ -1401,7 +1640,8 @@ class HintWatch:
         if h >= REACH_TIER:
             bot.stab('e')
         self.fives = self.fives + 1 if h >= 5 else 0
-        if h >= 5 and not self.skip_inreach and (self.best >= INREACH_FROM or self.fives >= INREACH_REPEAT):
+        if h >= 5 and not self.skip_inreach and ((self.best >= INREACH_FROM and self.fives >= INREACH_AGREE)
+                                                 or self.fives >= INREACH_REPEAT):
             raise InReach
         agreed, self.last = h == self.last, h
         if not agreed:
@@ -1512,6 +1752,8 @@ def _nav_to(bot, sl, j, watch, pool=None):
             bot.hold(keys, chunk)
             ms -= chunk
             watch(bot)
+            if STILL_AWARE:
+                bot.moving(True)
             if watch.last is not None:
                 bot.best_band = max(bot.best_band, watch.last)
                 if first is None:
@@ -1528,10 +1770,10 @@ def _tap_if_close(bot):
         bot.stab('e')
 
 
-def _press(bot, tier):
+def _press(bot):
     hook, bot.on_slice = bot.on_slice, None
     try:
-        return finish(bot, COLLECT_TAPS if tier >= 5 else NEAR_TAPS)
+        return finish(bot)
     finally:
         bot.on_slice = hook
 
@@ -1549,16 +1791,16 @@ def _collect_here(bot):
                 if bot.peek() is None and collected(bot):
                     raise Collected
         bot.release()
-        for i in range(COLLECT_TRIES):
+        for _ in range(COLLECT_TRIES):
             bot.tap('e')
             bot.wait(COLLECT_GAP)
             if bot.peek() is None and collected(bot):
                 raise Collected
-            if i % 8 == 7:
-                bot.tap(' ')
-                for _ in range(3):
-                    bot.wait(0.08)
-                    bot.tap('e')
+        zoom_in(bot)
+        bot.tap(' ')
+        for _ in range(3):
+            bot.wait(0.08)
+            bot.tap('e')
         for d in (0, 2, 4, 6):
             nudge(bot, d, 150)
             bot.release()
@@ -1630,6 +1872,8 @@ def _probe_hunt(bot):
                 if not playing(bot):
                     raise Collected
             h = bot.peek()
+            if STILL_AWARE:
+                bot.moving(True)
             if h is None:
                 blanks += 1
                 if blanks >= GONE_SAMPLES and collected(bot):
@@ -1645,9 +1889,7 @@ def _probe_hunt(bot):
                 if agree >= (2 if abs(h - tier) == 1 else 5):
                     tier, pending, agree = h, None, 0
                     bot.say('%5.1fs  %-22s %d fit' % (t, TIERS[tier], len(sl.fits())))
-            if max(tier, h) >= REACH_TIER:
-                bot.stab('e')
-            if tier >= COLLECT_TIER:
+            if tier >= COLLECT_TIER:                    # no E on this walk: its keys are not the bot's to lift
                 bot.say('%5.1fs  %s: leaving the walk' % (t, TIERS[tier]))
                 break
             if t * 1000.0 >= settle:
@@ -1670,7 +1912,7 @@ def _probe_hunt(bot):
     tried, pressed_for, closed_for = set(), set(), set()
     if tier is not None and tier >= COLLECT_TIER:
         ring = (where.at(bot), BORD[5 - tier] + SLACK)
-        if _press(bot, tier):
+        if _press(bot):
             return True
     watch = HintWatch()
     bot.on_slice = watch
@@ -1694,7 +1936,12 @@ def _probe_hunt(bot):
         if not playing(bot):
             raise Collected
         here = where.at(bot)
-        order = [j for j in sl.order(here, ring) if j not in tried] or sl.order(here, ring)
+        order = [j for j in sl.order(here, ring) if j not in tried]
+        if not order and ring is not None and RING_KEEP:
+            bot.say('nothing where it read close - looking wider again')    # one wrong reading must not pin it there
+            ring, hot_searches = None, 0
+            continue
+        order = order or sl.order(here, ring)
         j = order[0]
         goal = sl.xy[j]
         if (ring is not None and ring[1] <= BORD[1] + SLACK and hot_searches < HOT_SEARCHES
@@ -1731,7 +1978,6 @@ def _probe_hunt(bot):
                 ring = (where.at(bot), r)
             reason = 'searched'
             watch.reset()
-        tier = max(tier, bot.best_band)
         if watch.best >= RING_TIER and watch.best_odo is not None:
             r = BORD[5 - watch.best] + SLACK
             if ring is None or r < ring[1]:
@@ -1740,7 +1986,7 @@ def _probe_hunt(bot):
             tried.add(j)
             sl.penalty[j] += TRIED / 2
         if reason == 'arrived':
-            if _press(bot, max(tier, COLLECT_TIER)):
+            if _press(bot):
                 return True
             loc.widen(WIDEN_STUDS)
             sl.penalty[j] += TRIED

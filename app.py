@@ -17,10 +17,30 @@ import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')      # numpy's maths library sets memory aside for every core as
+                                                        # it loads, and a PC short of it cannot open the macro
+
 from pynput import keyboard, mouse  # noqa: E402
 
-import game  # noqa: E402
-import solver  # noqa: E402
+try:
+    import game  # noqa: E402
+    import solver  # noqa: E402
+except ImportError as e:                                # the stock box cuts the message off before the reason
+    why = str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__
+    try:
+        folder = os.path.join(os.getenv('LOCALAPPDATA') or os.path.expanduser('~'), 'ManasMinigameMacro')
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, 'startup_error.txt'), 'w', encoding='utf-8') as f:
+            f.write('%s\n\nexe: %s\n' % (e, sys.executable))
+    except OSError:
+        pass
+    ctypes.windll.user32.MessageBoxW(0, 'The macro could not load one of its own files.\n\n%s\n\n'
+                                     'Most often an antivirus removed it, or the PC is out of memory:\n'
+                                     '  - add the macro to your antivirus exclusions and download it again\n'
+                                     '  - close other programs, then open it again\n\n'
+                                     'Send this message to Manas if it keeps happening.' % why,
+                                     'Manas Minigame Macro', 0x10)
+    sys.exit(1)
 
 BG, PANEL, SUNK, EDGE = '#101116', '#16181f', '#0c0d11', '#272b36'
 TEXT, DIM, ACCENT, GOOD, BAD = '#e6e8f0', '#767d92', '#aaaaff', '#7ee08a', '#ef6b6b'
@@ -30,7 +50,7 @@ SMALL_BUTTON = dict(bg=SUNK, fg=TEXT, activebackground=SUNK, activeforeground=AC
                     highlightthickness=1, highlightbackground=EDGE)
 
 TITLE = 'Manas Minigame Macro'
-VERSION = '1.3.0'
+VERSION = '1.3.1'
 UPDATE_TRIES = 4                        # startup update checks, in case the network is not up yet
 UPDATE_RETRY_S = 20
 RELEASE_PAGE = 'https://github.com/ManasAarohi1/ManasMinigameMacro/releases/latest'
@@ -39,7 +59,8 @@ RELEASES = (os.environ.get('MMM_UPDATE_URL')
 INVITE = 'https://discord.gg/oppression'
 GAME_LINK = 'https://www.roblox.com/games/15532962292/Sols-RNG'     # opened by Start when Roblox is shut and no server link is set
 AHK_DOWNLOAD = 'https://www.autohotkey.com/download/1.1/'
-ITEM_EVERY = 3                          # rounds between item passes
+ITEM_EVERY_S = {game.SC: 20 * 60, game.BR: 35 * 60}    # a Strange Controller lasts 20 minutes, a Biome Randomizer 35
+ITEM_RETRY_S = 5 * 60                   # one that could not be used is tried again this much later
 LOOP_ROUNDS = 10 ** 9                   # Continuous loop: keeps going until Stop
 ENTER_WAITS = (5, 15, 30, 60, 120, 120)  # s between failed entries before the run is called off
 REJOIN_AFTER = 3                        # missed entries in a row before auto reconnect rejoins
@@ -478,13 +499,13 @@ class Calibrate(tk.Toplevel):
         tk.Toplevel.__init__(self, app.root, bg=BG)
         self.app = app
         self.only = points is not None          # just these buttons (the Play button); click mode is left alone
-        self.points = points or game.POINTS + game.LIME_POINTS + (game.AURA_POINTS if app.speed.get() == 'abyssal'
-                                                                  else ())
+        self.points = points or game.POINTS + game.LIME_POINTS + game.DAILY_POINTS + (
+            game.AURA_POINTS if app.speed.get() == 'abyssal' else ())
         self.capturing = None
         self.banner = None
         self.title('Calibrate click mode')
-        self.geometry('460x%d' % (220 + 50 * len(self.points)))
-        self.minsize(420, 120 + 50 * len(self.points))
+        self.geometry('460x%d' % min(220 + 50 * len(self.points), self.winfo_screenheight() - 140))
+        self.minsize(420, 300)                  # the list scrolls with the wheel when it does not fit
         self.configure(bg=BG)
         self.transient(app.root)
         self.protocol('WM_DELETE_WINDOW', self.finish)
@@ -495,11 +516,14 @@ class Calibrate(tk.Toplevel):
         tk.Label(head, text='Press Set, then click that button in Roblox. Your click goes through to the game as normal.',
                  bg=BG, fg=DIM, font=(UI, 9), wraplength=400, justify='left', anchor='w').pack(fill='x', pady=(4, 0))
 
-        body = card(self, fill='both', expand=True, padx=22)
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(side='bottom', fill='x', padx=22, pady=16)
+        body = card(app._scroller(self), fill='x', padx=22)
         self.rows = {}
         for i, (name, what) in enumerate(self.points):
             heading = {game.AURA_POINTS[0][0]: 'Abyssal mode',
-                       game.LIME_POINTS[0][0]: 'Lime buttons (optional)'}.get(name) if not self.only else None
+                       game.LIME_POINTS[0][0]: 'Lime buttons (optional)',
+                       game.DAILY_POINTS[0][0]: 'Daily rewards (optional)'}.get(name) if not self.only else None
             if heading:
                 tk.Label(body, text=heading, bg=PANEL, fg=TEXT, font=(UIB, 11), anchor='w').pack(
                     fill='x', padx=18, pady=(14, 2))
@@ -507,8 +531,6 @@ class Calibrate(tk.Toplevel):
                 rule(body, 18)
             self.rows[name] = self._row(body, name, what)
 
-        bar = tk.Frame(self, bg=BG)
-        bar.pack(fill='x', padx=22, pady=16)
         self.done_b = tk.Button(bar, text='Done', command=self.finish, bg=ACCENT, fg=BG, activebackground=ACCENT,
                                 activeforeground=BG, relief='flat', font=(UIB, 10), pady=9, cursor='hand2',
                                 borderwidth=0)
@@ -540,7 +562,7 @@ class Calibrate(tk.Toplevel):
             done = name in stored
             tick.configure(text='✓' if done else '•', fg=GOOD if done else DIM)
             b.configure(text='Redo' if done else 'Set')
-        optional = set() if self.only else {n for n, _ in game.LIME_POINTS}
+        optional = set() if self.only else {n for n, _ in game.LIME_POINTS + game.DAILY_POINTS}
         left = [n for n, _ in self.points if n not in stored and n not in optional]
         self.done_b.configure(text='Done' if not left else 'Done  (%d still to set)' % len(left))
 
@@ -712,6 +734,9 @@ class App:
         self.mode = 'vip'
         self.slow_pc = False
         self.need_rejoin = None     # why the client has to be rejoined
+        self.start_again = False
+        self.item_due = {}
+        self.daily_mark = time.time()   # the start, or the last try at the daily rewards
         self.rejoining = False
         self.watch = None
         self.aura_lost = None       # what a roll equipped in place of Abyssal Hunter
@@ -805,8 +830,7 @@ class App:
         self.giveup = self._field(box, 'Give up after', str(self.cfg['give_up_seconds']),
                                   'seconds to spend on one round before pressing Give up')
         rule(box)
-        self.auto_items = self._toggle(box, 'Auto SC + BR', 'use a Strange Controller and a Biome Randomizer at the '
-                                       'start, then every %d rounds' % ITEM_EVERY, 'auto_items')
+        self.auto_items = self._toggle(box, 'Auto SC + BR', '', 'auto_items')
         rule(box)
         self.click_mode = tk.BooleanVar(value=bool(self.cfg.get('click_mode')))
         row, self._click_text = self._row(box, 'Click mode', 'point at the buttons once, then use clicks instead of '
@@ -866,9 +890,10 @@ class App:
         text = tk.Frame(row, bg=PANEL)
         text.pack(side='left', fill='x', expand=True)
         tk.Label(text, text=label, bg=PANEL, fg=TEXT, font=(UIB, 10), anchor='w').pack(fill='x')
-        note = tk.Label(text, text=hint, bg=PANEL, fg=DIM, font=(UI, 8), anchor='w', justify='left', wraplength=300)
-        note.pack(fill='x', pady=(2, 0))
-        text.bind('<Configure>', lambda e: note.configure(wraplength=max(100, e.width)))
+        if hint:
+            note = tk.Label(text, text=hint, bg=PANEL, fg=DIM, font=(UI, 8), anchor='w', justify='left', wraplength=300)
+            note.pack(fill='x', pady=(2, 0))
+            text.bind('<Configure>', lambda e: note.configure(wraplength=max(100, e.width)))
         return row, text
 
     def _field(self, parent, label, default, hint):
@@ -996,7 +1021,7 @@ class App:
                 if held and not was.get(vk):                # kept reliably (remote desktops, other programs asking)
                     self.on_key(key)
                 was[vk] = held
-            time.sleep(0.03)
+            time.sleep(0.01)                                # a quick tap is down for 30-50 ms
 
     def on_key(self, key, *_):
         """Every keystroke passes here: compare, queue, never raise, never suppress."""
@@ -1108,7 +1133,10 @@ class App:
             self.click_mode.set(bool(kw['click_mode']))
         if 'update' in kw:
             self.offer_update(kw['update'])
-        if kw.get('action') == 'start' and not self.running:
+        if kw.get('action') == 'start' and self.running and solver.ABORT:
+            self.start_again = True                         # F1 while the last run is still stopping: start after it
+            self.phase('stopping - starting again after it', DIM)
+        elif kw.get('action') == 'start' and not self.running:
             self.start()
         elif kw.get('action') == 'stop' and self.running:
             self.stop()
@@ -1117,6 +1145,9 @@ class App:
         elif kw.get('action') == 'idle':
             self.start_b.configure(state='normal')
             self.stop_b.configure(state='disabled')
+            if self.start_again:
+                self.start_again = False
+                self.root.after(200, self.start)
             if self.pending_update is not None:
                 self.root.after(500, lambda f=self.pending_update: self.offer_update(f))
 
@@ -1133,6 +1164,8 @@ class App:
             return
         self.server_link = self.server.get().strip()
         self.reconnect_on = bool(self.auto_reconnect.get())
+        self.daily_mark = time.time()
+        self.item_due = {}                      # both items are due at the start
         self.browser_rejoin = bool(self.rejoin_browser.get())
         self.mode = self.speed.get()
         self.abyssal_on = self.mode == 'abyssal'
@@ -1276,6 +1309,9 @@ class App:
         if not os.path.exists(solver.DATA):
             return 'a data file is missing from this build (data.npz)'
         if game.interpreter() is None:
+            if game.interpreters(store=True):
+                return ('AutoHotkey from the Microsoft Store cannot be started by other programs - '
+                        'install AutoHotkey 1.1 from autohotkey.com as well')
             others = game.other_versions()
             if others:
                 return ('found AutoHotkey %s, but the paths need 1.1 - install 1.1 alongside it'
@@ -1412,7 +1448,7 @@ class App:
                 note('run', 'stopped: could not get back in after %d rounds' % (i - 1))
                 self.tell('Could not get into a round', 'stopped after %d rounds' % (i - 1), EMBED_BAD)
                 break
-            if self.use_items and i == 1 and not solver.ABORT:
+            if self.use_items and not solver.ABORT:      # only here, between rounds: never in the middle of one
                 self.spend_items()
             self.pause_failed = False
             if self.check_aura or self.abyssal_on:
@@ -1475,8 +1511,6 @@ class App:
                     except Exception as e:
                         self._set(phase='%s - could not press Give up (%s)' % (head, type(e).__name__), colour=BAD)
             save_stats(self.caught, self.seconds)
-            if self.use_items and not solver.ABORT and not self.need_rejoin and i % ITEM_EVERY == 0:
-                self.spend_items()
 
         solver.PAUSE = None
         game.stop_all()
@@ -1532,6 +1566,7 @@ class App:
         link = self.server_link if game.deeplink(self.server_link) else GAME_LINK
         if 'by itself' in (why or '') and self.connected():
             note('connection', 'already back in the game (%s): starting again from the way to Lime' % why)
+            self.claim_daily()
             game.ALIGNED = False
             self.watch = game.Watch()
             self.check_aura = self.abyssal_on
@@ -1543,6 +1578,7 @@ class App:
             if back:
                 note('connection', 'back in the game')
                 self.tell('Back in the game', '', EMBED_GOOD)
+                self.claim_daily()
                 game.ALIGNED = False
                 self.watch = game.Watch()
                 self.check_aura = self.abyssal_on
@@ -1574,11 +1610,27 @@ class App:
                 self.check_aura = self.abyssal_on
                 note('connection', 'rejoined')
                 self.tell('Rejoined the private server', '', EMBED_GOOD)
+                self.claim_daily()
                 return True
             wait = REJOIN_WAITS[min(k, len(REJOIN_WAITS) - 1)]
             self.tell('Could not rejoin', '%strying again in %ds' % (failed + ' - ' if failed else '', wait), EMBED_BAD)
             if not self.nap(wait):
                 return False
+
+    def claim_daily(self):
+        """First thing once back in: if a 23:00 GMT went by since the start (or the last claim), the daily rewards
+        window is up. Never raises."""
+        if game.daily_reset(time.time()) <= self.daily_mark or solver.ABORT:
+            return
+        self.daily_mark = time.time()
+        route = 'clicks' if game.daily_clicks_ready() else 'menu keys'
+        try:
+            game.paced(game.DAILY_WAIT_S)
+            done = game.daily_by_clicks() if route == 'clicks' else game.daily_by_keys(say=lambda m: note('daily', m))
+        except Exception as e:
+            done = False
+            note('daily', 'crashed: %s: %s' % (type(e).__name__, e))
+        note('daily', 'daily rewards by %s: %s' % (route, 'claimed and closed' if done else 'did not finish'))
 
     def wearing_abyssal(self, wait=10.0):
         """Does the log say Abyssal Hunter is equipped? Waits a little for a first aura line."""
@@ -1657,11 +1709,14 @@ class App:
         if self.watch is not None and not game.in_game(self.watch):    # mid-rejoin: the menus do not answer keys
             note('abyssal', 'not in the game yet - waiting before re-equipping')
             if not game.wait_back(stop=lambda: solver.ABORT, say=lambda m: note('abyssal', m), limit=EQUIP_WAIT_S):
-                return False
+                if solver.ABORT:
+                    return False
+                note('abyssal', 'the log never showed the game - trying the re-equip anyway')   # never the end of a run
         rolled, self.equipping = self.aura_lost, True
         try:
             self.tell('New aura rolled', '%s replaced Abyssal Hunter - re-equipping' % rolled, EMBED_INFO)
             note('abyssal', 'the log shows %s: re-equipping%s' % (rolled, ' mid round' if mid_round else ''))
+            tried = None
             for attempt in range(2):
                 if solver.ABORT:
                     return False
@@ -1672,6 +1727,9 @@ class App:
                 if not mid_round:
                     solver.clear_deadline()
                 route = 'clicks' if game.click_mode_on() and not game.aura_missing() else 'menu keys'
+                if attempt and route == 'clicks' and tried == 'clicks':
+                    route = 'menu keys'                 # the clicks did not take: the other way, which reads the screen
+                tried = route
                 try:
                     done = game.equip_by_clicks(stop=lambda: solver.ABORT) if route == 'clicks' else game.equip_by_keys(say=lambda m: note('abyssal', m))
                 except Exception as e:
@@ -1692,6 +1750,7 @@ class App:
                         return True
                     time.sleep(0.5)
                 note('abyssal', 'attempt %d: the log still shows %s after 12 s' % (attempt + 1, self.watch.aura))
+                game.screenshot('equip_failed_%d.png' % (attempt + 1))      # what was on screen when it did not take
                 self.close_guis()
             self.equip_fails += 1
             self.pause_failed = True            # once a round: a try costs half a minute
@@ -1708,23 +1767,30 @@ class App:
             self.equipping = False
 
     def spend_items(self):
-        """One Strange Controller + Biome Randomizer pass, between rounds; logged to items.log."""
+        """Between rounds: use each item whose time has come (both at the start); logged to items.log."""
         say = lambda m: note('items', m)
+        now = time.time()
+        due = tuple(t for t in (game.BR, game.SC) if now >= self.item_due.get(t, 0.0))
+        if not due:
+            return
         try:
-            got = game.item_pass(say=say)
+            got = game.item_pass(say=say, terms=due)
+            for t in due:
+                self.item_due[t] = now + (ITEM_EVERY_S[t] if t in got else ITEM_RETRY_S)
         except Exception as e:
+            for t in due:
+                self.item_due[t] = now + ITEM_RETRY_S
             say('failed - %s: %s' % (type(e).__name__, e))
             self.tell('Auto SC + BR failed', '%s: %s' % (type(e).__name__, e), EMBED_BAD)
             self.close_guis()
             return
-        if len(got) == 2:
-            self.tell('Used a Strange Controller and a Biome Randomizer')
-        elif got:
-            missed = game.BR if got[0] == game.SC else game.SC
-            self.tell('Used a %s' % pretty(got[0]), "%s wasn't used" % pretty(missed), EMBED_INFO)
+        missed = ', '.join(pretty(t) for t in due if t not in got)
+        if got:
+            self.tell('Used a ' + ' and a '.join(pretty(t) for t in got), missed and "%s wasn't used" % missed,
+                      EMBED_INFO if missed else None)
         else:
-            self.tell('Auto SC + BR found nothing to use', '', EMBED_INFO)
-        if len(got) < 2:
+            self.tell('Auto SC + BR found nothing to use', missed, EMBED_INFO)
+        if missed:
             self.close_guis()
 
     def close_guis(self):
@@ -1735,6 +1801,7 @@ class App:
 
     def stop(self):
         note('run', 'Stop pressed')
+        self.start_again = False
         solver.ABORT = True
         if self.biome_stop is not None:
             self.biome_stop.set()

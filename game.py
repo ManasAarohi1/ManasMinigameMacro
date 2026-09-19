@@ -142,13 +142,40 @@ def time_from_line(line):
     return stamp.replace(tzinfo=datetime.timezone.utc).timestamp()
 
 
+TRAY_MARK = b"AppState/TrayMode"    # Roblox's tray icon is a RobloxPlayerBeta too, with a log of its own...
+GAME_MARK = b"! Joining game"       # ...but a game opened from the tray icon carries on in that same log
+_tray = {}                          # path: False for a game's log, else how far a tray log has been searched
+
+
+def tray_log(path):
+    """Is this the log of the tray icon alone, with no game in it (yet)?"""
+    seen = _tray.get(path)
+    if seen is False:
+        return False
+    try:
+        with open(path, "rb") as f:
+            if seen is None:
+                head = f.read(8192)
+                if TRAY_MARK not in head:
+                    if len(head) == 8192:
+                        _tray[path] = False
+                    return False                        # too new to tell: asked again next time
+                seen = 0
+            f.seek(max(0, seen - len(GAME_MARK)))
+            data = f.read()
+            _tray[path] = False if GAME_MARK in data else f.tell()
+    except OSError:
+        return False
+    return _tray[path] is not False
+
+
 def player_logs(log_dir=LOG_DIR):
-    """Client logs, newest first."""
+    """Game client logs, newest first."""
     try:
         names = [os.path.join(log_dir, n) for n in os.listdir(log_dir) if n.endswith(".log") and "_Player_" in n]
     except OSError:
         return []
-    return sorted(names, key=os.path.getmtime, reverse=True)
+    return [n for n in sorted(names, key=os.path.getmtime, reverse=True) if not tray_log(n)]
 
 
 def newest_log(log_dir=LOG_DIR):
@@ -665,8 +692,16 @@ def _scan(base, match, depth=3):
                 yield os.path.join(root, f)
 
 
-def interpreters():
-    """Every AutoHotkey 1.1 on this machine, newest first."""
+def startable(path):
+    """False for an exe inside a Microsoft Store package: Windows lets no other program start those
+    ('access denied'). The shortcuts the Store puts under the user's own WindowsApps folder do start."""
+    full = os.path.normcase(os.path.abspath(path))
+    mine = os.path.normcase(os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'WindowsApps'))
+    return (os.sep + 'windowsapps' + os.sep) not in full or full.startswith(mine + os.sep)
+
+
+def interpreters(store=False):
+    """Every AutoHotkey 1.1 on this machine that can be started, newest first (store: the ones that cannot)."""
     names = {n.lower() for n in AHK_EXES}
     seen, out = set(), []
     for p in (h for h in (shutil.which(n) for n in AHK_EXES) if h):
@@ -682,6 +717,7 @@ def interpreters():
                 seen.add(key)
                 if not _is_v2(p):
                     out.append(p)
+    out = [p for p in out if startable(p) != store]
     order = [n.lower() for n in AHK_EXES]
     out.sort(key=lambda p: (file_version(p) or _version(p), -order.index(os.path.basename(p).lower())), reverse=True)
     return out
@@ -728,7 +764,7 @@ def interpreter():
     """The settings' ahk_path if it is 1.1, else the best one found, else None."""
     try:
         chosen = (load_settings().get('ahk_path') or '').strip()
-        if chosen and os.path.isfile(chosen) and not _is_v2(chosen):
+        if chosen and os.path.isfile(chosen) and not _is_v2(chosen) and startable(chosen):
             return chosen
     except Exception:
         pass
@@ -1093,14 +1129,51 @@ def tier(hue):
     return int(np.searchsorted(CUTS, hue))
 
 
-def inventory_open():
-    def shares(box):
-        g = grab(client_box(box)).mean(axis=2)
-        return (g < 30).mean(), (g > 200).mean()
+def window_part(box, w, h):
+    """Pixels (left, top, right, bottom) in a w x h client of a part of the Inventory / Aura Storage window,
+    given as fractions of a 16:9 client. The window is half the client wide whatever the client's shape, keeps
+    its own shape and sits in the middle: only the width sets its size, so heights are measured from the centre."""
+    y = lambda f: int(round(h / 2.0 + (f - 0.5) * w * 9.0 / 16.0))
+    return int(round(box[0] * w)), y(box[1]), int(round(box[2] * w)), y(box[3])
 
-    td, tb = shares(INVENTORY_TITLE)
-    xd, xb = shares(INVENTORY_X)
-    return bool(td >= 0.6 and 0.08 <= tb <= 0.45 and xd >= 0.5 and 0.05 <= xb <= 0.45)
+
+def window_box(box):
+    """The same on the screen."""
+    l, t, r, b = client_box((0.0, 0.0, 1.0, 1.0))
+    x0, y0, x1, y1 = window_part(box, r - l, b - t)
+    return l + x0, t + y0, l + x1, t + y1
+
+
+WINDOW_TOP = 0.2556      # the window's top edge, as a fraction of a 16:9 client
+
+
+def inventory_open(rgb=None):
+    """Is a window up? The Inventory and Aura Storage share one frame: a bright line along the top, a title in
+    white and an X. The frame is see-through, so how dark it is depends on the scenery behind it; what is looked
+    for is white lettering on something darker, and the frame's top edge right across where the window would be."""
+    if rgb is None:
+        rgb = grab(client_box((0.0, 0.0, 1.0, 1.0)))
+    h, w = rgb.shape[:2]
+
+    def lettering(box):
+        x0, y0, x1, y1 = window_part(box, w, h)
+        c = rgb[max(0, y0):y1, x0:x1].astype(np.int16)
+        if not c.size:
+            return 0.0, 255.0
+        white = (c.min(-1) > 185) & (c.max(-1) - c.min(-1) < 40)
+        rest = c.mean(-1)[~white]
+        return float(white.mean()), float(rest.mean()) if rest.size else 255.0
+
+    title, behind = lettering(INVENTORY_TITLE)
+    cross, _ = lettering(INVENTORY_X)
+    if not (0.06 <= title <= 0.5 and behind < 120 and 0.02 <= cross <= 0.5):
+        return False
+    top = window_part((0, WINDOW_TOP, 0, WINDOW_TOP), w, h)[1]
+    g = rgb[:, int(0.27 * w):int(0.73 * w)].mean(-1)
+    d = max(2, int(round(w / 512.0)))
+    edge = max((float((g[y] - g[y + 3 * d] >= 20).mean()) for y in range(top - 3 * d, top + 3 * d + 1)
+                if 0 <= y < h - 3 * d), default=0.0)
+    return edge >= 0.7
 
 
 def _group(mask, origin, row_gap, col_gap, min_area):
@@ -1543,7 +1616,7 @@ def close_inventory():
     """Close the Inventory if the camera align opened it. True if it was open."""
     if take_foreground() is None or not inventory_open():
         return False
-    b = client_box(INVENTORY_X)
+    b = window_box(INVENTORY_X)
     print('   the Inventory is open -- closing it')
     for _ in range(3):
         click((b[0] + b[2]) // 2, (b[1] + b[3]) // 2)
@@ -1609,6 +1682,7 @@ class Watch:
         self.aura = None                      # last equipped aura the log reported
         self.aura_since = None
         self.in_menu = False                  # on the title screen
+        self.menu_at = 0.0                    # when the log last said so
         self.fresh = time.time()              # when the log last grew
         self.dropped = None                   # why the game was lost since trouble() last asked, even if it is back
         self._lock = threading.RLock()        # the connection thread and the round both poll
@@ -1650,6 +1724,7 @@ class Watch:
                             self.in_menu = False
                         elif 'In Main Menu' in line:
                             self.in_menu = True
+                            self.menu_at = time_from_line(line) or now
                         if aura is not None and aura != self.aura:
                             self.aura = aura
                             self.aura_since = time_from_line(line) or now
@@ -1692,13 +1767,11 @@ class Watch:
 
 
 def roblox_running():
-    for p in psutil.process_iter(['name']):
-        try:
-            if (p.info['name'] or '').lower() == ROBLOX_EXE:
-                return True
-        except psutil.Error:
-            continue
-    return False
+    """Is a game client up? Going by its window: the tray icon Roblox leaves behind is the same exe."""
+    try:
+        return find_roblox_window() is not None
+    except Exception:
+        return False
 
 
 def play_mask(rgb):
@@ -1720,9 +1793,14 @@ def find_play():
     return int(x), int(y)
 
 
+MENU_S = 90.0            # the title screen is believed this long after the log last named it: some clients never
+                         # log the aura again once Play is pressed, and the macro sat waiting for a rejoin for ever
+
+
 def in_game(watch):
     """A real aura in the log and not on the menu ('Equipped _None_' also shows on the title screen)."""
-    return watch.aura not in (None, '_None_') and not watch.in_menu
+    on_menu = watch.in_menu and time.time() - getattr(watch, 'menu_at', time.time()) < MENU_S
+    return watch.aura not in (None, '_None_') and not on_menu
 
 
 def wait_back(stop=None, say=lambda m: None, limit=600.0):
@@ -1802,20 +1880,23 @@ def roblox_processes():
 
 
 def close_roblox(wait=15.0):
-    """Kill every Roblox client process and wait until none is left. True once they are all gone."""
+    """Kill every Roblox client process until the game's window is gone. True once it is.
+    (Not until no process is left: the tray icon can come straight back, and other tools carry Roblox's name.)"""
     end = time.time() + wait
     while True:
         left = roblox_processes()
         if not left:
             return True
-        if time.time() >= end:
-            return False
         for p in left:
             try:
                 p.kill()
             except psutil.Error:
                 pass
         time.sleep(0.5)
+        if not roblox_running():
+            return True
+        if time.time() >= end:
+            return False
 
 
 BROWSERS = {'chrome.exe', 'msedge.exe', 'brave.exe', 'opera.exe', 'firefox.exe', 'vivaldi.exe', 'arc.exe',
@@ -2347,14 +2428,26 @@ def shut_windows(n=AURAS):
     paced(SETTLE_S)
 
 
+SMALL = 0.028            # of the width: narrower than any slot
+
+
 def window_search(tab=0):
     """In an open window, to its tab number `tab` and then its search box, which is returned."""
     if not tab:                                         # from a slot, Up is the box. Not by way of the top bar:
         got = selected()                                # in a round Give up sits under it, where the tab should be
-        for _ in range(3):
-            if got is not None and got[0] == 'search':
+        for _ in range(6):                              # it opens on a slot, on the whole list, or on Equip
+            if got is None:
+                break
+            if got[0] == 'search':
                 return got
-            got = nav_press(Key.up)
+            if got[0] == 'slot' and got[3] < SMALL:     # the little buttons at the end of the box's row
+                got = nav_press(Key.left)
+            elif got[0] in ('slot', 'grid'):
+                got = nav_press(Key.up)
+            else:
+                got = nav_press(Key.down if got[0] == 'tab' else Key.right)   # from Equip the list is to the right
+        if got is not None and got[0] == 'search':
+            return got
         raise NavLost('no search box over the list')
     nav_anchor()
     nav_press(Key.left)                                 # the bar under the aura's name; a bright aura can hide its frame
@@ -2516,6 +2609,54 @@ def camera_by_keys(say=print):
         nav_off()
 
 
+DAILY_POINTS = (('daily_claim', 'Daily rewards: Claim button'), ('daily_close', 'Daily rewards: Close button'))
+DAILY_RESET_H = 23       # the hour, GMT, the daily rewards come round
+DAILY_WAIT_S = 2.0       # s after getting back in for their window to show
+DAILY_KINDS = ('button', 'tab', 'equip', 'panel', 'slot', 'other')   # what Claim and Close may read as: nothing
+                                                                     # outside a window, and never Give up
+
+
+def daily_reset(t):
+    """The last 23:00 GMT at or before t. Epoch seconds count from midnight GMT, whatever this PC's time zone."""
+    shift = DAILY_RESET_H * 3600
+    return (t - shift) // 86400 * 86400 + shift
+
+
+def daily_by_keys(say=print):
+    """Claim the daily rewards and close their window: from the corner Left, Down is Claim, and Close is to its
+    right. With no such window Down lands on the roll row, where Enter is held back. True once both were pressed."""
+    if not steady_front():
+        return False
+    try:
+        nav_on()
+        nav_anchor()
+        nav_press(Key.left)
+        claim = nav_press(Key.down, DAILY_KINDS)
+        nav_enter(DAILY_KINDS)
+        paced(SETTLE_S)
+        close = nav_press(Key.right, DAILY_KINDS)
+        if close[1] < claim[1] + 0.02:
+            raise NavLost('no Close to the right of Claim')
+        nav_enter(DAILY_KINDS)
+        paced(SETTLE_S)
+        return True
+    except (NavLost, NotFocused) as e:
+        say('daily rewards stopped without pressing anything it was unsure of: %s' % e)
+        screenshot('daily_lost.png')
+        return False
+    finally:
+        nav_off()
+
+
+def daily_clicks_ready():
+    stored = load_points()
+    return click_mode_on() and all(name in stored for name, _ in DAILY_POINTS)
+
+
+def daily_by_clicks():
+    return press_point('daily_claim', settle=1.0) and press_point('daily_close', settle=0.5)
+
+
 def nav_to_use():
     """From a chosen slot to Use: the amount box comes first, and Use is the same box again to its right."""
     amount = nav_beside('panel')
@@ -2566,8 +2707,8 @@ def save_slot(rgb, sel, term, slot, what):
         pass
 
 
-def item_pass(say=print):
-    """One pass: a Biome Randomizer, then a Strange Controller. Returns what was used."""
+def item_pass(say=print, terms=(BR, SC)):
+    """One pass: one of each item in `terms`. Returns what was used."""
     if stopped():
         return []
     if not steady_front():
@@ -2576,18 +2717,19 @@ def item_pass(say=print):
     paced(SETTLE_S)
     used = []
     if click_mode_on():
-        for term in (BR, SC):
+        for term in terms:
             if click_use(term, say):
                 used.append(term)
             else:
                 say('%s: not used' % term)
-            if not stopped():
+            if not stopped() and (window_seen() or not sees_windows()):
                 press_point('inventory', settle=0.6)     # close it again
+            close_inventory()
         return used
     try:
         nav_on()
         open_window(INVENTORY)
-        for term in (BR, SC):
+        for term in terms:
             if use_by_keys(term, say):
                 used.append(term)
             else:
@@ -2697,7 +2839,7 @@ def click_align(stop=None):
 
 def click_use(term, say):
     """Open Inventory -> Items, search, and use the item by clicking; the same slot check as the keyboard route."""
-    if stopped() or not press_point('inventory', settle=0.7):
+    if not open_by_click('inventory', stopped):
         return False
     if stopped() or not press_point('items', settle=0.5):
         return False
@@ -2726,19 +2868,70 @@ def click_use(term, say):
     return False
 
 
-def equip_by_clicks(stop=None):
-    """Auras, search, type, Enter, first slot, Equip, Auras again to close."""
-    halted = lambda: bool(stop and stop())
-    for name, settle in (('aura_storage', 0.8), ('aura_search', 0.4)):
-        if halted() or not press_point(name, settle=settle):
-            return False
-    type_term(ABYSSAL_TERM)
-    tap(Key.enter)
-    paced(0.6)
-    for name, settle in (('aura_slot', 0.5), ('aura_equip', 0.6), ('aura_storage', 0.5)):
-        if halted() or not press_point(name, settle=settle):
-            return False
+OPEN_TRIES = 3           # clicks on a side button before its window counts as not opening
+OPEN_WAIT = 1.5          # s more for a window that is slow to show, before its button is clicked again
+
+
+_sees_windows = None     # has a window ever been recognised on this PC? Until one has, not seeing one says nothing
+
+
+def sees_windows():
+    global _sees_windows
+    if _sees_windows is None:
+        try:
+            _sees_windows = bool(load_settings().get('sees_windows'))
+        except Exception:
+            _sees_windows = False
+    return _sees_windows
+
+
+def window_seen():
+    global _sees_windows
+    if not inventory_open():
+        return False
+    if not sees_windows():
+        _sees_windows = True
+        try:
+            save_settings({'sees_windows': True})        # remembered: the next session's first click is checked too
+        except Exception:
+            pass
     return True
+
+
+def open_by_click(name, halted=lambda: False):
+    """Click a side button until its window is seen open. The button is a toggle and a new aura's cutscene
+    swallows clicks, so clicking blind can end up a step out: shutting the window, then typing into the game.
+    On a screen where the windows are not recognised at all (another size or shape of window) the one click is
+    taken on trust, as it always was."""
+    close_inventory()                                   # whatever is up already goes by its X
+    for _ in range(OPEN_TRIES):
+        if halted() or not press_point(name, settle=0.8):
+            return False
+        if window_seen():
+            return True
+        paced(OPEN_WAIT)
+        if window_seen() or not sees_windows():
+            return True
+    return False
+
+
+def equip_by_clicks(stop=None):
+    """Auras (seen open), search, type, Enter, first slot, Equip, Auras again to close (seen shut)."""
+    halted = lambda: bool(stop and stop())
+    try:
+        if not open_by_click('aura_storage', halted):
+            return False
+        if halted() or not press_point('aura_search', settle=0.4):
+            return False
+        type_term(ABYSSAL_TERM)
+        tap(Key.enter)
+        paced(0.6)
+        for name, settle in (('aura_slot', 0.5), ('aura_equip', 0.6), ('aura_storage', 0.5)):
+            if halted() or not press_point(name, settle=settle):
+                return False
+        return True
+    finally:
+        close_inventory()                               # never left open over the round
 
 
 def _grab_window():

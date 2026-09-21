@@ -199,7 +199,7 @@ MODE_PX = 10.0
 STALL_HAZARD = 0.01
 STALL_S = 0.8
 POS_SD = 0.6
-STILL_AWARE = True       # what the screen says about moving is evidence of where it is, like the hint
+STILL_AWARE = True       # standing still on screen tells the belief it is stuck (hills, ledges, walls)
 STILL_MISS = 0.3         # the screen says standing still: how likely that is for a particle walking freely
 MOVING_MISS = 0.65       # the screen says moving (or cannot tell): how likely for a particle held up by a wall
 STILL_FEW = 0.1          # standing still with less of the belief than this held up: it is not where it thinks,
@@ -921,6 +921,17 @@ class Nav:
         self._removed.append((u, v, f, r))
         self._fields.clear()
 
+    def block_climbs(self, v):
+        """Every jump onto node v, out of the graph till restore().
+
+        A ledge it cannot get up from one side it usually cannot get up from the next either, and
+        taking those one at a time is where the lost rounds go: a lost round has a median of eleven
+        `that jump did not get there`, a collected one none.
+        """
+        for u, _ in list(self.rev[v]):
+            if any(e[0] == v and e[3] for e in self.fwd[u]):
+                self.block(u, v)
+
     def restore(self):
         for u, v, f, r in self._removed:
             self.fwd[u] += f
@@ -1085,22 +1096,24 @@ SETTLE_MS = 250          # let the character stop before a standing reading
 SAMPLES = 5
 SLICE_MS = 150           # how finely a walk is chopped up
 BACKOFF_MS = 60          # step back off a wall before a new direction
+CLIMB_BLOCK = 2          # failed jumps onto one node before every other way up onto it goes too.
+                         # Off: written, never measured -- turn it on in the sim before it ships.
 JUMP_EVERY = 1000
 SLIDE = (1, -1, 2, -2)   # 45-degree turns to try when blocked
 COLLECT_TIER = 4         # "very close": press E while walking
-REACH_TIER = 4           # E is only pressed where it can reach: every press costs a stop (STILL_S)
+REACH_TIER = 5           # E on the way only with it right in front: every press costs a stop (STILL_S + AFTER_S)
 STAB_S = 0.012           # a press with no dwell
 CLOSE_SLICE_MS = 100
 GONE_SAMPLES = 5         # blank reads in a row before believing the hint has gone
-COLLECT_TAPS = 12        # standing still never brings E into reach or into view: press a little, then move
-NEAR_TAPS = 6
+COLLECT_TAPS = 30
+NEAR_TAPS = 12
 COLLECT_GAP = 0.10
 E_GAP_S = 0.25           # at least this long between E presses: spamming E gets players kicked
 WALK_E_GAP_S = 0.9       # and this long between the ones that interrupt a walk
 STILL_S = 0.3            # the game kicks for collecting on the move: the keys are up this long before E goes down
 AFTER_S = 0.3            # ...and stay up this long after it: the server hears of the E a moment later
 FINISH_RIDE_MS = 500     # keep walking the arrival heading while the hint does not drop
-COLLECT_NUDGE = 3
+COLLECT_NUDGE = 6
 PATH_TRIES = 3
 
 DEADLINE = None
@@ -1130,13 +1143,31 @@ def cut_short():
     CUT, DEADLINE = True, time.perf_counter()
 
 
-def out_of_time():
-    return ABORT or (DEADLINE is not None and time.perf_counter() >= DEADLINE)
+NEAR_EXTRA_S = 30.0      # once a round: past the give-up time while the hint reads very close or closer
+NEAR_FRESH_S = 3.0
+EXTENDED = False
+
+
+def out_of_time(say=print):
+    global DEADLINE, EXTENDED
+    if ABORT:
+        return True
+    now = time.perf_counter()
+    if DEADLINE is None or now < DEADLINE:
+        return False
+    t, at = game.LAST_TIER
+    if not CUT and not EXTENDED and t is not None and t >= COLLECT_TIER and now - at < NEAR_FRESH_S:
+        EXTENDED = True
+        DEADLINE = now + NEAR_EXTRA_S
+        say('give-up time, but it reads %s - %d s more' % (TIERS[min(5, t)], NEAR_EXTRA_S))
+        return False
+    return True
 
 
 def start_clock(seconds):
-    global DEADLINE, ABORT, CUT
-    ABORT = CUT = False
+    global DEADLINE, ABORT, CUT, EXTENDED
+    ABORT = CUT = EXTENDED = False
+    game.LAST_TIER = (None, 0.0)
     DEADLINE = None if not seconds else time.perf_counter() + float(seconds)
 
 
@@ -1212,11 +1243,11 @@ def nudge(bot, d, ms):
 
 
 def reach_out(bot):
-    if bot.best_band >= COLLECT_TIER:
-        if bot.best_band >= 5:
-            bot.tap('e')
-        else:
-            bot.stab('e')
+    """E on the way, going by what the hint reads now (not the best it read this round: a walk away from the
+    melon would keep stopping for E)."""
+    now = getattr(bot, 'last_tier', bot.best_band)
+    if now is not None and now >= REACH_TIER:
+        bot.tap('e')
 
 
 def go_back_to(bot, mark):
@@ -1275,23 +1306,24 @@ def collected(bot):
 
 
 def zoom_in(bot):
-    """Beside it and E is not taking: zoom all the way in and only a little back out, once a round."""
+    """Beside the watermelon: zoom all the way in and barely back out, once a round, so the pick-up is in view."""
     if getattr(bot, 'zoomed', False) or not hasattr(bot, 'zoom_close'):
         return
     bot.zoomed = True
-    bot.say('E is not taking - zooming in closer')
+    bot.say('beside it - zooming in closer')
+    keys = tuple(bot.held)
+    bot.release()                                       # not walking on past it while the wheel turns
     bot.zoom_close()
+    if keys:
+        bot.hold(keys, 0)
 
 
-def finish(bot):
-    """Press E until the hint goes. True if collected. Goes by what the hint reads here and now:
-    under "very close" E cannot reach, so there is no pressing at all."""
-    seen = [h for h in (bot.peek(), bot.peek()) if h is not None]
-    if seen and max(seen) < COLLECT_TIER:
-        bot.say('reads %s here - too far for E, moving on' % TIERS[max(seen)])
-        return False
-    taps = COLLECT_TAPS if seen and max(seen) >= 5 else NEAR_TAPS
-    bot.say('%s - collecting' % TIERS[max(seen)] if seen else 'no hint - collecting')
+def finish(bot, taps=COLLECT_TAPS):
+    """Press E until the hint goes. True if collected."""
+    bot.say('%s - collecting' % TIERS[min(5, bot.best_band)])
+    near = bot.peek()
+    if near is not None and near >= COLLECT_TIER:
+        zoom_in(bot)
     keys = tuple(bot.held)
     if keys in DIRS and FINISH_RIDE_MS > 0:
         d, best, left = DIRS.index(keys), bot.peek(), FINISH_RIDE_MS
@@ -1316,7 +1348,6 @@ def finish(bot):
             bot.say('the hint is gone - collected')
             return True
         if i % COLLECT_NUDGE == COLLECT_NUDGE - 1:
-            zoom_in(bot)
             bot.tap(' ')
             for _ in range(3):
                 bot.wait(0.08)
@@ -1326,9 +1357,6 @@ def finish(bot):
                 return True
             move(bot, (i // COLLECT_NUDGE) * 2 % 8, 250)
             bot.release()
-            h = bot.peek()
-            if h is not None and h < COLLECT_TIER:
-                break
     bot.say('still showing a hint - not collected, carrying on')
     return False
 
@@ -1385,6 +1413,7 @@ class Bot:
         self.motion = game.Motion()
         self.held = ()
         self.stopped_at = self.e_at = 0.0
+        self.last_tier = None
         self.facing, self.since_jump, self.slide, self.best_band = None, 0, 1, -1
         self.on_slice = None
         self.quiet = quiet
@@ -1439,6 +1468,8 @@ class Bot:
             if on_keys:
                 on_keys(keys)
             self.hold(keys, 0)
+            if self.motion is not None:
+                self.motion.rested()                    # the next look must not be held against the stand
         return True
 
     def let_go(self):
@@ -1524,7 +1555,8 @@ class Bot:
 
     def peek(self):
         h, _ = game.hues()
-        return None if h is None else game.tier(h)
+        self.last_tier = None if h is None else game.tier(h)
+        return self.last_tier
 
     def look(self):
         """Stand still, take several readings, return the middle one."""
@@ -1549,15 +1581,15 @@ HOT_KEEP = True          # a trip whose hint got closer is not dropped for a "be
 RING_TIER = 3            # a reading this close pins the search round there
 INREACH_FROM = 3         # "right in front of me" stops the walk after an agreed reading this close,
 INREACH_REPEAT = 3       # ...or this many in a row
-INREACH_AGREE = 2        # and never on one reading alone: scenery behind the hint can look like the phrase
-RING_KEEP = True         # False: a ring whose spawns were all stood on is kept anyway (as before 1.2.13)
+INREACH_AGREE = 2        # two such readings before it stops to press E: one alone is often wrong
+RING_KEEP = False        # as in 1.2.0: a ring whose spawns were all stood on is kept
 LOST_STUDS = 6.0         # the belief is lost: scatter it this far...
 LOST_BACK = 30.0         # ...round anywhere it was this many seconds back
 SEARCH_OUT_MS = 600
 SEARCH_ARM_MAX = 1000
 CLIMBS = 3               # times a closer reading can move the search centre
 HOT_SEARCHES = 2         # searches where it read close before a trip may leave that ring
-COLLECT_TRIES = 4
+COLLECT_TRIES = 30
 REACH_PUSH_MS = 400
 NAV_LEG_PX = 40.0
 NAV_STALL = 6            # legs without getting nearer: give that spawn up for now
@@ -1689,8 +1721,9 @@ def _nav_to(bot, sl, j, watch, pool=None):
         return 'unreachable'
     best, stall, relocs, keys = math.inf, 0, 0, ()
     jumped, recent, blocks, first = None, [], 0, None
+    climbs = {}              # node -> jumps onto it that did not get there
     while True:
-        if out_of_time():
+        if out_of_time(bot.say):
             return 'time'
         landing_for = 0
         while keys and loc.airborne() and landing_for < 8:
@@ -1726,7 +1759,12 @@ def _nav_to(bot, sl, j, watch, pool=None):
             jumped = None
             if left >= before - 2.0:
                 nv.block(*edge)
-                bot.say('that jump did not get there - trying another way')
+                climbs[edge[1]] = climbs.get(edge[1], 0) + 1
+                if CLIMB_BLOCK and climbs[edge[1]] >= CLIMB_BLOCK:
+                    nv.block_climbs(edge[1])
+                    bot.say('that ledge will not take a jump - going round it')
+                else:
+                    bot.say('that jump did not get there - trying another way')
                 continue
         if jump and nv.last_edge is not None:
             jumped = (nv.last_edge, left)
@@ -1770,10 +1808,10 @@ def _tap_if_close(bot):
         bot.stab('e')
 
 
-def _press(bot):
+def _press(bot, tier):
     hook, bot.on_slice = bot.on_slice, None
     try:
-        return finish(bot)
+        return finish(bot, COLLECT_TAPS if tier >= 5 else NEAR_TAPS)
     finally:
         bot.on_slice = hook
 
@@ -1782,6 +1820,7 @@ def _collect_here(bot):
     """Walk on a little tapping E, then stand and press, then short steps round about."""
     keys = tuple(bot.held)
     bot.say('right in front of me - pressing E')
+    zoom_in(bot)
     hook, bot.on_slice = bot.on_slice, None
     try:
         if keys:
@@ -1791,16 +1830,16 @@ def _collect_here(bot):
                 if bot.peek() is None and collected(bot):
                     raise Collected
         bot.release()
-        for _ in range(COLLECT_TRIES):
+        for i in range(COLLECT_TRIES):
             bot.tap('e')
             bot.wait(COLLECT_GAP)
             if bot.peek() is None and collected(bot):
                 raise Collected
-        zoom_in(bot)
-        bot.tap(' ')
-        for _ in range(3):
-            bot.wait(0.08)
-            bot.tap('e')
+            if i % 8 == 7:
+                bot.tap(' ')
+                for _ in range(3):
+                    bot.wait(0.08)
+                    bot.tap('e')
         for d in (0, 2, 4, 6):
             nudge(bot, d, 150)
             bot.release()
@@ -1809,6 +1848,8 @@ def _collect_here(bot):
                 bot.wait(COLLECT_GAP)
             if bot.peek() is None and collected(bot):
                 raise Collected
+        now = bot.peek()
+        bot.say('E did not take - it reads %s now' % ('nothing' if now is None else TIERS[now]))
     finally:
         bot.on_slice = hook
 
@@ -1863,7 +1904,7 @@ def _probe_hunt(bot):
     walk = bot.walk((), PROBE_AHK)
     try:
         for t in walk:
-            if out_of_time():
+            if out_of_time(bot.say):
                 bot.say('out of time')
                 return False
             now = time.perf_counter()
@@ -1912,13 +1953,13 @@ def _probe_hunt(bot):
     tried, pressed_for, closed_for = set(), set(), set()
     if tier is not None and tier >= COLLECT_TIER:
         ring = (where.at(bot), BORD[5 - tier] + SLACK)
-        if _press(bot):
+        if _press(bot, tier):
             return True
     watch = HintWatch()
     bot.on_slice = watch
     idle, last_visit, hot_searches = 0, -1e9, 0
     while True:
-        if out_of_time():
+        if out_of_time(bot.say):
             bot.say('out of time')
             return False
         now = bot.now()
@@ -1978,6 +2019,7 @@ def _probe_hunt(bot):
                 ring = (where.at(bot), r)
             reason = 'searched'
             watch.reset()
+        tier = max(tier, bot.best_band)
         if watch.best >= RING_TIER and watch.best_odo is not None:
             r = BORD[5 - watch.best] + SLACK
             if ring is None or r < ring[1]:
@@ -1986,7 +2028,7 @@ def _probe_hunt(bot):
             tried.add(j)
             sl.penalty[j] += TRIED / 2
         if reason == 'arrived':
-            if _press(bot):
+            if _press(bot, max(tier, COLLECT_TIER)):
                 return True
             loc.widen(WIDEN_STUDS)
             sl.penalty[j] += TRIED

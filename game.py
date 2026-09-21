@@ -24,7 +24,6 @@ import psutil
 from mousekey import MouseKey
 from PIL import Image, ImageGrab
 from pynput.keyboard import Controller as KeyboardController, Key
-from pynput.mouse import Button, Controller as MouseController
 
 import solver
 
@@ -313,6 +312,22 @@ def set_pace(base):
     BASE_PACE, PACE = base, base
 
 
+def fresh_session():
+    """Everything closing the program and opening it again would have cleared, cleared by Start.
+
+    Nothing about the paths is learned or kept: blocked edges last a round, the belief is built
+    from scratch every round, and none of it is written down. What a restart really cleared was
+    this handful of flags, which is why restarting sometimes got it out of a spot it kept getting
+    stuck in -- so Start clears them too and a restart buys nothing a run does not.
+    """
+    global ALIGNED, LIME_SIGHT, _lime_missed, _nav_toggles, _nav_last, _window, _said_refused
+    ALIGNED = False
+    LIME_SIGHT, _lime_missed = True, 0      # look for the dialogue again: the last run may have given up on it
+    _nav_toggles, _nav_last = 0, None       # what UI navigation was believed to be doing
+    _window = (0.0, None)                   # the cached Roblox window
+    _said_refused = False                   # say again if Windows blocks the mouse
+
+
 def slower():
     global PACE
     PACE = min(3.0, PACE + 0.5)
@@ -329,7 +344,6 @@ def faster():
 
 MENU_KEY = 'ui navigation'   # stands for the key set in the window; tap() presses it
 kb = KeyboardController()
-mouse = MouseController()
 mkey = MouseKey()
 
 
@@ -350,10 +364,31 @@ def in_front():
         return False
 
 
-def wait_for_front(grace=3.0):
+FRONT_EVERY = 2.0        # least time between two goes at taking the foreground back
+_took_front = 0.0
+
+
+def wait_for_front(grace=3.0, take=True):
+    """Roblox in front before a key goes out, bringing it forward if it has slipped behind.
+
+    Waiting for it to come back on its own was not enough: anything that takes focus for a moment --
+    a notification, the macro's own window, a click on the desktop -- and every key after it was
+    refused. On screen that is the macro walking up to Lime and then doing nothing at all.
+    """
+    global _took_front
     end = time.monotonic() + grace
     while not in_front():
         if time.monotonic() > end:
+            # once every FRONT_EVERY at most: a key goes out many times a second, and grabbing the
+            # foreground at that rate is a fight with whatever the person is doing, not a fix
+            if take and time.monotonic() - _took_front > FRONT_EVERY:
+                _took_front = time.monotonic()
+                try:
+                    focus_roblox(verify=False)
+                except RuntimeError:
+                    pass
+                if in_front():
+                    return
             raise NotFocused('Roblox is not the window in front; key not sent')
         time.sleep(0.05)
 
@@ -380,6 +415,22 @@ def up(key):
     _down.discard(key)
 
 
+STUCK_VK = (0x5B, 0x5C, 0x12, 0xA4, 0xA5, 0x79, 0x09, 0x25, 0x26, 0x27, 0x28, 0xA0, 0xA1, 0xA2, 0xA3)
+# Windows, Alt, F10, Tab, the arrows, the modifiers: keys this program does not send, lifted anyway when
+# something else has left one down -- a killed walk, a keystroke the game swallowed. A Windows key held
+# down is a Start menu over everything and a PC its owner restarts.
+
+
+def _lift_stuck():
+    for vk in STUCK_VK:
+        try:
+            if u32.GetAsyncKeyState(vk) & 0x8000:        # only what is really down: a bare up can open Start
+                u32.SendInput(1, ctypes.byref(IN(type=1, ki=KI(wVk=vk, wScan=0, dwFlags=KEYUP,
+                                                               time=0, dwExtraInfo=0))), ctypes.sizeof(IN))
+        except OSError:
+            pass
+
+
 def release_all(focus=True):
     """Every key up, into Roblox if something is held."""
     if focus and _down:
@@ -395,6 +446,7 @@ def release_all(focus=True):
             pass
         time.sleep(0.005)
     _down.clear()
+    _lift_stuck()
 
 
 _armed = False
@@ -440,13 +492,59 @@ def tap(key, hold=None, gap=None):
     paced(STEP_DELAY if gap is None else gap)
 
 
+MOVE_ABS = 0x0001 | 0x8000 | 0x4000        # move, absolute, across every monitor
+BTN_DOWN = {'left': 0x0002, 'right': 0x0008, 'middle': 0x0020}
+BTN_UP = {'left': 0x0004, 'right': 0x0010, 'middle': 0x0040}
+WHEEL = 0x0800
+_said_refused = False
+
+
+def _mouse(flags, data=0, dx=0, dy=0):
+    """One mouse event. False when Windows refuses to send it rather than silently doing nothing."""
+    global _said_refused
+    inp = IN(type=0, mi=MI(dx=dx, dy=dy, mouseData=data & 0xFFFFFFFF, dwFlags=flags, time=0, dwExtraInfo=0))
+    if u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp)):
+        return True
+    if not _said_refused:
+        _said_refused = True
+        err = ctypes.get_last_error()
+        print('   Windows refused the mouse input (error %d)%s' % (
+            err, ' -- Roblox is running as administrator and this is not' if err == 5 else ''))
+    return False
+
+
+def to_abs(x, y):
+    """A screen pixel as the 0-65535 position SendInput takes, over every monitor."""
+    vx, vy, vw, vh = (u32.GetSystemMetrics(i) for i in (76, 77, 78, 79))
+    return round((x - vx) * 65535 / max(1, vw - 1)), round((y - vy) * 65535 / max(1, vh - 1))
+
+
+def cursor():
+    p = wintypes.POINT()
+    u32.GetCursorPos(ctypes.byref(p))
+    return p.x, p.y
+
+
 def move_to(x, y):
     """Absolute pointer move in screen pixels, on any monitor."""
-    vx, vy, vw, vh = (ctypes.windll.user32.GetSystemMetrics(i) for i in (76, 77, 78, 79))
-    mi = MI(dx=round((x - vx) * 65535 / max(1, vw - 1)), dy=round((y - vy) * 65535 / max(1, vh - 1)),
-            mouseData=0, dwFlags=0x0001 | 0x8000 | 0x4000, time=0, dwExtraInfo=0)
-    inp = IN(type=0, mi=mi)
-    u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+    dx, dy = to_abs(x, y)
+    return _mouse(MOVE_ABS, dx=dx, dy=dy)
+
+
+def button(name, down):
+    """Press or release a mouse button where the pointer is.
+
+    The position rides along with the button event. A press on its own carries no
+    coordinates, so it is resolved against whatever pointer position was last taken
+    notice of -- which after a scaled display or a move on a second monitor is not
+    where the pointer is, and the click lands on nothing with nothing saying so.
+    """
+    dx, dy = to_abs(*cursor())
+    return _mouse(MOVE_ABS | (BTN_DOWN if down else BTN_UP)[name], dx=dx, dy=dy)
+
+
+def scroll(notches):
+    return _mouse(WHEEL, data=int(notches) * 120)
 
 
 def client_rect(window):
@@ -488,21 +586,30 @@ def foreground_hwnd():
 
 
 def force_foreground(hwnd):
+    """Roblox to the front, without tying this program's input to another program's.
+
+    AttachThreadInput makes two threads share one input queue: while they are attached, a hang in
+    either stops keyboard and mouse for both -- and this used to attach to whatever window was in
+    front, which on a desktop or a taskbar click is Explorer. That is a whole Windows UI that stops
+    answering. The quiet ways go first, and the attach that is left is to Roblox's own thread only.
+    """
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+    if foreground_hwnd() == hwnd:
+        return True
+    user32.SwitchToThisWindow(hwnd, True)          # what alt-tab itself uses; no shared input queue
+    if foreground_hwnd() == hwnd:
+        return True
     current = kernel32.GetCurrentThreadId()
     target = user32.GetWindowThreadProcessId(hwnd, None)
-    active = user32.GetWindowThreadProcessId(foreground_hwnd(), None)
-    attached = {t for t in (target, active) if t and t != current}
-    for thread_id in attached:
-        user32.AttachThreadInput(current, thread_id, True)
-    try:
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-    finally:
-        for thread_id in attached:
-            user32.AttachThreadInput(current, thread_id, False)
+    if target and target != current and user32.AttachThreadInput(current, target, True):
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            user32.AttachThreadInput(current, target, False)
     return foreground_hwnd() == hwnd
 
 
@@ -555,39 +662,45 @@ def move_camera():
     else:
         left, top, width, height = client_rect(window)
     x = round(left + width * 700 / 1920)
-    mkey.move_to(x, round(top + height * 200 / 1080))
+    move_to(x, round(top + height * 200 / 1080))
     paced(STEP_DELAY)
-    mouse.press(Button.right)
+    button('right', True)
     paced(STEP_DELAY)
-    mkey.move_to(x, round(top + height * 900 / 1080))
+    move_to(x, round(top + height * 900 / 1080))
     paced(STEP_DELAY)
-    mouse.release(Button.right)
+    button('right', False)
     paced(STEP_DELAY)
     zoom()
 
 
 ZOOM_OUT = 75            # notches back from all the way in: the view every walk is timed for
-ZOOM_CLOSE = 50          # beside the watermelon and E is not taking: closer, so the pick-up is in view
+ZOOM_CLOSE = 12          # beside the watermelon: all the way in and barely back out, so the pick-up is in view
+ZOOMED = False           # the closer zoom is on: the next entry puts the usual one back
 
 
 def zoom(out=ZOOM_OUT):
     """All the way in, then `out` notches back out."""
-    mouse.scroll(0, 300)
+    global ZOOMED
+    scroll(300)
     paced(STEP_DELAY)
-    mouse.scroll(0, -out)
+    scroll(-out)
+    ZOOMED = out != ZOOM_OUT
 
 
-def zoom_close():
-    """The closer zoom, with the pointer over the game so the wheel reaches it."""
-    global ALIGNED
+def zoom_close(out=ZOOM_CLOSE):
+    """The closer zoom, with the pointer over the game so the wheel reaches it. Only the zoom changes, not where
+    the camera looks: the next entry puts the usual zoom back (zoom_usual) and needs no fresh camera set-up."""
     window = find_roblox_window()
     if window is None:
         return
     left, top, width, height = client_rect(window)
-    mkey.move_to(round(left + width * 700 / 1920), round(top + height * 200 / 1080))
+    move_to(round(left + width * 700 / 1920), round(top + height * 200 / 1080))
     paced(STEP_DELAY)
-    zoom(ZOOM_CLOSE)
-    ALIGNED = False                                 # the next entry sets the usual view again
+    zoom(out)
+
+
+def zoom_usual():
+    zoom_close(ZOOM_OUT)
 
 
 def respawn():
@@ -849,13 +962,55 @@ def walk_script(name, marker=None, text=None):
     ])
 
 
+NEVER_PRESSED = {'cmd', 'cmd_l', 'cmd_r', 'win', 'lwin', 'rwin', 'f10', 'menu', 'alt', 'alt_l', 'alt_r',
+                 'alt_gr', 'ctrl', 'ctrl_l', 'ctrl_r', 'shift', 'shift_l', 'shift_r'}
+
+
 def menu_press_key(key=None):
-    """The UI navigation key set in the window, as pynput presses it: a character, or a key name like Tab."""
+    """The UI navigation key set in the window, as pynput presses it: a character, or a key name like Tab.
+
+    Never a key that belongs to Windows. The field takes any pynput key name, so `cmd` or `f10` in it
+    means the macro opens the Start menu or a menu bar over the game every time it turns navigation on,
+    and a name pynput has no key for raises instead. Either way the default takes its place.
+    """
     key = str(load_settings().get('menu_key') if key is None else key).strip() or '\\'
-    return key if len(key) == 1 else getattr(Key, key.lower(), key)
+    if key.lower() in NEVER_PRESSED:
+        print('   %r is a Windows key, not a Roblox one - using \\ for UI navigation' % key)
+        return '\\'
+    if len(key) == 1:
+        return key
+    found = getattr(Key, key.lower(), None)
+    if isinstance(found, Key):
+        return found
+    print('   there is no key called %r - using \\ for UI navigation' % key)
+    return '\\'
 
 
 WALK_PREFIX = 'path_'
+WALK_DIR = os.path.join(APP_DIR, 'walks')     # walks live here, not loose in temp -- which, with no TEMP set,
+_walk_slot = 0                                # is the folder the program was started from: the exe's own folder
+
+
+def walk_dir():
+    try:
+        os.makedirs(WALK_DIR, exist_ok=True)
+        return WALK_DIR
+    except OSError:
+        return tempfile.gettempdir()
+
+
+def walk_folders():
+    """Where walk scripts are written now, and everywhere older builds left them."""
+    out = [walk_dir(), tempfile.gettempdir()]
+    try:
+        out.append(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)))
+    except Exception:
+        pass
+    seen = []
+    for f in out:
+        if f and f not in seen:
+            seen.append(f)
+    return seen
 
 
 def our_walks():
@@ -878,21 +1033,30 @@ def our_walks():
 _swept = 0.0
 
 
-def sweep_walk_files(older_than=600.0, every=60.0):
-    """Delete walk scripts left in temp when the kill beat the delete to the file."""
+def sweep_walk_files(older_than=120.0, every=10.0):
+    """Delete walk scripts and markers left behind, wherever any build of this has written them.
+
+    A file is only touched once it is older than the longest walk, so one that is being walked right
+    now is left alone. Older builds took a fresh random name whenever the last script was still held,
+    and only swept temp every ten minutes: on a PC with no TEMP set that is hundreds of loose .ahk
+    files in the folder the program was started from.
+    """
     global _swept
     now = time.time()
     if now - _swept < every:
         return
     _swept = now
-    tmp = tempfile.gettempdir()
-    try:
-        names = os.listdir(tmp)
-    except OSError:
-        return
-    for n in names:
-        if n.lower().startswith(WALK_PREFIX) and n.lower().endswith('.ahk'):
-            f = os.path.join(tmp, n)
+    for folder in walk_folders():
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for n in names:
+            low = n.lower()
+            if not ((low.startswith(WALK_PREFIX) and low.endswith('.ahk'))
+                    or (low.startswith('ahk_go_') and low.endswith('.txt'))):
+                continue
+            f = os.path.join(folder, n)
             try:
                 if now - os.path.getmtime(f) > older_than:
                     os.remove(f)
@@ -921,18 +1085,28 @@ def start_walk(name, text=None):
     exe = interpreter()
     if not exe:
         raise RuntimeError('AutoHotkey v1 not found; the paths are v1 syntax')
+    global _walk_slot
     kill_walks()
-    mark = os.path.join(tempfile.gettempdir(), 'ahk_go_%d.txt' % os.getpid())
+    folder = walk_dir()
+    mark = os.path.join(folder, 'ahk_go_%d.txt' % os.getpid())
     if os.path.exists(mark):
         os.remove(mark)
-    tmp = os.path.join(tempfile.gettempdir(), '%s%d.ahk' % (WALK_PREFIX, os.getpid()))
-    try:                             # one name per macro: #SingleInstance Force then replaces the last walk
-        with open(tmp, 'w') as f:
-            f.write(walk_script(name, mark, text))
-    except OSError:                  # still held by the walk that is going: take a fresh name
-        fd, tmp = tempfile.mkstemp(suffix='.ahk', prefix=WALK_PREFIX, dir=tempfile.gettempdir())
-        with os.fdopen(fd, 'w') as f:
-            f.write(walk_script(name, mark, text))
+    script = walk_script(name, mark, text)
+    tmp = None
+    for _ in range(2):               # two names per macro, not a fresh one every time the last is still held
+        tmp = os.path.join(folder, '%s%d_%d.ahk' % (WALK_PREFIX, os.getpid(), _walk_slot))
+        try:
+            # utf-8 with the mark AutoHotkey 1.1 reads as utf-8. Written in the machine's own codec,
+            # a script naming a path this PC's codepage cannot spell -- a Windows username in
+            # Cyrillic, Greek or CJK -- does not get written at all, and no round is ever entered.
+            with open(tmp, 'w', encoding='utf-8-sig') as f:
+                f.write(script)
+            break
+        except OSError:
+            _walk_slot ^= 1
+            tmp = None
+    if tmp is None:
+        raise RuntimeError('could not write the walk script to %s' % folder)
     proc = subprocess.Popen([exe, tmp], creationflags=NO_WINDOW)     # no /f: it switches #SingleInstance off
     proc._tmp, proc._mark = tmp, mark
     return proc
@@ -1124,9 +1298,15 @@ def hues(rgb=None):
     return float(np.median(hh)), n
 
 
+LAST_TIER = (None, 0.0)   # the latest hint reading and when
+
+
 def tier(hue):
     """0 = farthest phrase, 5 = closest."""
-    return int(np.searchsorted(CUTS, hue))
+    global LAST_TIER
+    t = int(np.searchsorted(CUTS, hue))
+    LAST_TIER = (t, time.perf_counter())
+    return t
 
 
 def window_part(box, w, h):
@@ -1317,6 +1497,10 @@ class Motion:
     def forget(self):
         self.box, self.prev, self.loud, self.quiet, self.bright = None, None, 0.0, 0, None
 
+    def rested(self):
+        """The character stood still on purpose: the picture from before says nothing about being blocked."""
+        self.prev, self.quiet = None, 0
+
     def frame(self, pad=True):
         if self.box is None:
             self.box = client_box(self.BOX)
@@ -1399,13 +1583,14 @@ def click(x, y, park=True):
     if take_foreground() is None:
         return False
     time.sleep(random.uniform(0.15, 0.30))
-    for px, py in move_path(mouse.position, (x, y)):
+    for px, py in move_path(cursor(), (x, y)):
         move_to(int(round(px)), int(round(py)))
         time.sleep(random.uniform(0.006, 0.018))
-    time.sleep(random.uniform(0.06, 0.18) * PACE)
-    mouse.press(Button.left)
+    time.sleep(random.uniform(0.06, 0.18) * PACE)   # let the button see the pointer arrive
+    if not button('left', True):
+        return False
     time.sleep(random.uniform(0.06, 0.12) * PACE)
-    mouse.release(Button.left)
+    button('left', False)
     if park:
         time.sleep(0.3 * PACE)
         move_to(int(x + random.uniform(-40, 40)), int(y + random.uniform(140, 200)))
@@ -1470,9 +1655,19 @@ def talk_to_lime(bot):
     """Pick [Minigame] then the ticket: click mode's calibrated spots if both are set, else found by colour."""
     points = load_points()
     if all(name in points for name, _ in LIME_POINTS) and click_mode_on():
-        paced(LIME_WAIT_S)
-        press_point('minigame', settle=1.5)
-        press_point('ticket', settle=0.3)
+        # The calibrated spots are right; what went wrong was clicking one before the dialogue
+        # was drawn, which Roblox swallows and the round never starts. Watch for each prompt
+        # with the same sight the colour route uses, and only click on the timer -- a fifth
+        # longer than it was -- when it is never seen.
+        first = lime_prompt('[Minigame]')
+        paced(LIME_SEEN_S if first else LIME_WAIT_S)
+        press_point('minigame', settle=LIME_SEEN_S)
+        second = lime_prompt('[-1 Minigame Ticket]', prev=first)
+        if not second:
+            paced(LIME_SETTLE_S)
+        press_point('ticket', settle=0)
+        ticket_pressed()
+        paced(LIME_AFTER_S)
         return entered()
     first = wait_for('[Minigame]')
     if not first:
@@ -1488,8 +1683,17 @@ def talk_to_lime(bot):
         print('   the ticket prompt never came up')
         return False
     click(second[0], second[1])
+    ticket_pressed()
     entered()
     return True
+
+
+TICKET_AT = None         # when [-1 Minigame Ticket] was last pressed: the round's time counts from here
+
+
+def ticket_pressed():
+    global TICKET_AT
+    TICKET_AT = time.perf_counter()
 
 
 def entered():
@@ -1529,7 +1733,34 @@ def shut_by_sight():
 
 
 LIME_POINTS = (('minigame', '[Minigame] button'), ('ticket', '[-1 Minigame Ticket]'))
-LIME_WAIT_S = 2.0        # after E, before the calibrated [Minigame] click
+LIME_WAIT_S = 2.4        # after E, before the calibrated [Minigame] click, when the dialogue is never seen
+LIME_SETTLE_S = 1.8      # before the ticket click, same
+LIME_SEEN_S = 0.5        # after a prompt is seen drawn, before clicking it
+LIME_AFTER_S = 0.4       # after the ticket click
+LIME_LOOK_S = 6.0        # longest to watch for each prompt before clicking on the timer anyway
+LIME_SIGHT = True        # the dialogue is being seen; two misses in a row and the look is not worth its seconds
+_lime_missed = 0
+
+
+def lime_prompt(what, prev=None):
+    """The prompt on screen, or None -- and on a client where it is never seen, None without the wait.
+
+    Clicking a calibrated spot before the dialogue is drawn is what lost a quarter of the entries,
+    so it is worth waiting to see it. It is not worth waiting six seconds a round on a client whose
+    dialogue this never picks up, which is the reason those spots were calibrated in the first place.
+    """
+    global LIME_SIGHT, _lime_missed
+    if not LIME_SIGHT:
+        return None
+    found = wait_for(what, prev=prev, timeout=LIME_LOOK_S)
+    if found:
+        _lime_missed = 0
+        return found
+    _lime_missed += 1
+    if _lime_missed >= 2:
+        LIME_SIGHT = False
+        print('   the dialogue is not being seen -- clicking the calibrated spots on the timer from now on')
+    return None
 
 
 def reset_and_align(stop, align=True):
@@ -1541,6 +1772,9 @@ def reset_and_align(stop, align=True):
         focus_roblox()
         respawn()
         paced(STEP_DELAY)
+        if ZOOMED:
+            zoom_usual()                                # the last round zoomed in beside its watermelon
+            paced(STEP_DELAY)
         return True
     ALIGNED = click_align(stop=stop) if click_mode_on() else align_camera(stop=stop)
     return ALIGNED
@@ -1753,7 +1987,7 @@ class Watch:
     def trouble(self, quiet_s=None, check_process=True):
         """Why the client needs rejoining, or None."""
         quiet_s = QUIET_S if quiet_s is None else quiet_s
-        if check_process and not roblox_running():
+        if check_process and roblox_gone():
             return 'Roblox is not running'
         if self.poll() == 'lost':
             self.dropped = None
@@ -1766,12 +2000,25 @@ class Watch:
         return None
 
 
+GONE_S = 15.0            # the window missing this long in a row before Roblox counts as closed
+_window_seen = 0.0
+
+
 def roblox_running():
     """Is a game client up? Going by its window: the tray icon Roblox leaves behind is the same exe."""
+    global _window_seen
     try:
-        return find_roblox_window() is not None
+        up = find_roblox_window() is not None
     except Exception:
-        return False
+        up = False
+    if up:
+        _window_seen = time.monotonic()
+    return up
+
+
+def roblox_gone():
+    """Closed for sure: one look can miss a window that is being made again, resized or redrawn after a rejoin."""
+    return not roblox_running() and time.monotonic() - _window_seen > GONE_S
 
 
 def play_mask(rgb):
@@ -2038,7 +2285,7 @@ AURA_POINTS = (
     ('aura_equip', 'Equip button'),
 )
 AURA_NAMES = [name for name, _ in AURA_POINTS]
-ABYSSAL = 'Abyssal'      # the logged aura must contain this
+ABYSSAL = 'Abyssal'
 ABYSSAL_TERM = 'abyssal hunter'
 SC, BR = 'strange controller', 'biome randomizer'
 SLOTS = 2
@@ -2500,6 +2747,15 @@ SELECT_PRESSES = 3       # Enter on the found Abyssal Hunter this many times; ch
 AURA_ROW = 8             # slots in one row of Aura Storage
 
 
+def is_abyssal(aura):
+    """Abyssal Hunter itself (or awakened), not a look-alike such as Doodle_AbyssalHunter, which misses Lime."""
+    return re.sub('[^a-z]', '', (aura or '').lower()).startswith('abyssalhunter')
+
+
+def abyssal_variant(aura):
+    return ABYSSAL.lower() in (aura or '').lower() and not is_abyssal(aura)
+
+
 def abyssal_slot(cfg=None):
     """Which found Abyssal Hunter to equip: the setting, kept to 1..AURA_ROW."""
     try:
@@ -2807,9 +3063,18 @@ def to_screen(point):
 
 
 def press_point(name, settle=0.45):
-    """Click a calibrated button. False if it is not calibrated or Roblox would not come forward."""
+    """Click a calibrated button. False if it is not calibrated or Roblox would not come forward.
+
+    A point is a fraction of the Roblox window, so there has to be a window to turn it back into
+    a pixel. Without one `client_box` falls back to a 2560x1440 screen at 0,0 and every calibrated
+    click lands somewhere else entirely -- which looks exactly like a calibration that changed by
+    itself. Nothing is clicked instead.
+    """
     stored = load_points()
     if name not in stored:
+        return False
+    if find_roblox_window() is None:
+        print('   no Roblox window to click in -- not clicking %s' % name)
         return False
     if not click(*to_screen(stored[name]), park=False):
         return False
@@ -2916,7 +3181,7 @@ def open_by_click(name, halted=lambda: False):
 
 
 def equip_by_clicks(stop=None):
-    """Auras (seen open), search, type, Enter, first slot, Equip, Auras again to close (seen shut)."""
+    """Auras (seen open), search, type, Enter, the calibrated slot, Equip, Auras again to close (seen shut)."""
     halted = lambda: bool(stop and stop())
     try:
         if not open_by_click('aura_storage', halted):
@@ -2969,3 +3234,187 @@ def read_slot(rgb=None):
     if sel is None:
         return None, 'empty'
     return sel, kind_at(((sel[0] + sel[2]) / 2, (sel[1] + sel[3]) / 2), rgb, r=0.3 * (sel[2] - sel[0]))
+
+
+# ================================================================ self check (python game.py)
+def _sent(fn):
+    """Every mouse event the call makes, as (flags, dx, dy, data)."""
+    out, real = [], u32.SendInput
+
+    def fake(n, inp, size):
+        mi = ctypes.cast(inp, ctypes.POINTER(IN)).contents.mi
+        out.append((mi.dwFlags, mi.dx, mi.dy, mi.mouseData))
+        return 1
+    u32.SendInput = fake
+    try:
+        fn()
+    finally:
+        u32.SendInput = real
+    return out
+
+
+def _lime_run(seen):
+    """talk_to_lime in click mode against `seen` prompts, as (waits, points pressed)."""
+    global LIME_SIGHT, _lime_missed
+    me = sys.modules[__name__]
+    waits, pressed = [], []
+    kept = {n: getattr(me, n) for n in ('wait_for', 'press_point', 'entered', 'paced',
+                                        'load_points', 'click_mode_on')}
+    me.wait_for = lambda what, prev=None, timeout=None: (100, 200, 9000) if seen else None
+    me.press_point = lambda name, settle=0.0: pressed.append(name) or True
+    me.entered = lambda: True
+    me.paced = lambda s: waits.append(s)
+    me.load_points = lambda: {n: (0.5, 0.9) for n, _ in LIME_POINTS}
+    me.click_mode_on = lambda: True
+    LIME_SIGHT, _lime_missed = True, 0
+    try:
+        assert talk_to_lime(None) is True
+    finally:
+        for n, fn in kept.items():
+            setattr(me, n, fn)
+    return waits, pressed
+
+
+def demo():
+    me = sys.modules[__name__]
+
+    events = _sent(lambda: button('left', True))
+    assert events and events[0][0] == MOVE_ABS | BTN_DOWN['left'], events
+    assert events[0][1] > 0 or events[0][2] > 0, 'the press went out with no position: %s' % (events,)
+    print('  a press carries the absolute position it happens at')
+
+    real_front, real_pace = me.take_foreground, PACE
+    me.take_foreground, me.PACE = lambda *a, **k: True, 0.0
+    try:
+        events = _sent(lambda: click(300, 200, park=False))
+        assert events[-1][0] == MOVE_ABS | BTN_UP['left'], events[-1]
+        assert events[-2][0] == MOVE_ABS | BTN_DOWN['left'], events[-2]
+        assert len(events) > 3, 'no pointer move before the click: %d' % len(events)
+        print('  a click moves, presses and releases: %d events' % len(events))
+
+        real_send = u32.SendInput
+        u32.SendInput = lambda *a: 0
+        me._said_refused = False
+        try:
+            assert click(300, 200, park=False) is False, 'a blocked click reported success'
+        finally:
+            u32.SendInput = real_send
+        print('  a click Windows refuses comes back False')
+    finally:
+        me.take_foreground, me.PACE = real_front, real_pace
+
+    waits, pressed = _lime_run(seen=True)
+    assert pressed == ['minigame', 'ticket'], pressed
+    assert waits == [LIME_SEEN_S, LIME_AFTER_S], waits
+    print('  lime seen: both buttons pressed as each prompt is drawn')
+
+    waits, pressed = _lime_run(seen=False)
+    assert pressed == ['minigame', 'ticket'], pressed
+    assert waits == [LIME_WAIT_S, LIME_SETTLE_S, LIME_AFTER_S], waits
+    assert sum(waits[:2]) >= (2.0 + 1.5) * 1.2, 'the blind timer is not a fifth longer: %s' % waits
+    print('  lime unseen: falls back to the timer, %.1fs against the old 3.5s' % sum(waits[:2]))
+    assert LIME_SIGHT is False, 'kept spending %gs a round looking for a dialogue it never sees' % LIME_LOOK_S
+    print('  lime unseen twice: the look is given up on for the rest of the run')
+
+    real_find = me.find_roblox_window
+    me.find_roblox_window = lambda: None
+    try:
+        assert press_point('minigame') is False, 'clicked a fraction with no window to measure it against'
+    finally:
+        me.find_roblox_window = real_find
+    print('  no Roblox window: no calibrated click at all')
+
+    ALIGNED_was = (True, 2, 1, True)
+    me.ALIGNED, me._lime_missed, me._nav_toggles, me._said_refused = ALIGNED_was
+    me.LIME_SIGHT = False
+    fresh_session()
+    assert (ALIGNED, LIME_SIGHT, _lime_missed, _nav_toggles, _said_refused) == (False, True, 0, 0, False)
+    print('  Start clears what closing and reopening the program used to clear')
+
+    for bad in ('cmd', 'f10', 'win', 'shift', 'banana'):
+        assert menu_press_key(bad) == chr(92), bad
+    assert menu_press_key('tab') is Key.tab and menu_press_key('p') == 'p'
+    print('  the UI navigation key is never a Windows key, and never one pynput cannot press')
+
+    ups, real_state, real_send = [], u32.GetAsyncKeyState, u32.SendInput
+    u32.GetAsyncKeyState = lambda vk: 0x8000 if vk == 0x5B else 0
+    u32.SendInput = lambda n, inp, size: (ups.append(ctypes.cast(inp, ctypes.POINTER(IN)).contents.ki.wVk), 1)[1]
+    try:
+        _lift_stuck()
+    finally:
+        u32.GetAsyncKeyState, u32.SendInput = real_state, real_send
+    assert ups == [0x5B], ups
+    print('  a Windows key left down is lifted; keys that are already up are left alone')
+
+    grabs, front = [], {'is': False}
+
+    def _slow_came(verify=True):
+        grabs.append(1)
+        front['is'] = False            # it does not come forward: the next key must not try again at once
+
+    kept2, real2 = me.in_front, me.focus_roblox
+    me.in_front, me.focus_roblox, me._took_front = lambda: front['is'], _slow_came, 0.0
+    try:
+        for _ in range(5):
+            try:
+                wait_for_front(grace=0.0)
+            except NotFocused:
+                pass
+        assert len(grabs) == 1, 'took the foreground %d times in a row instead of once' % len(grabs)
+    finally:
+        me.in_front, me.focus_roblox = kept2, real2
+    print('  a window that will not come forward is not fought over every key')
+
+    front, took = {'is': False}, []
+
+    def _came(verify=True):
+        took.append(1)
+        front['is'] = True
+
+    kept_front, real_focus = me.in_front, me.focus_roblox
+    me.in_front, me.focus_roblox, me._took_front = lambda: front['is'], _came, 0.0
+    try:
+        wait_for_front(grace=0.0)
+        assert took, 'gave up on a key instead of bringing Roblox forward'
+        print('  a key with Roblox behind another window brings it forward first')
+        front['is'] = False
+        me.focus_roblox = lambda verify=True: None          # it will not come forward
+        try:
+            wait_for_front(grace=0.0)
+            raise AssertionError('sent a key into whatever window was in front')
+        except NotFocused:
+            pass
+        print('  and is refused, not sent elsewhere, when it will not')
+    finally:
+        me.in_front, me.focus_roblox = kept_front, real_focus
+
+    folder = os.path.join(tempfile.gettempdir(), 'mmm \u0414\u043e\u043c')    # a name cp1252 cannot spell
+    os.makedirs(folder, exist_ok=True)
+    kept = {n: getattr(me, n) for n in ('walk_dir', 'kill_walks', 'interpreter')}
+    real_popen = subprocess.Popen
+    me.walk_dir, me.kill_walks, me.interpreter = lambda: folder, lambda: None, lambda: 'ahk.exe'
+    subprocess.Popen = lambda *a, **k: type('P', (), {})()
+    try:
+        proc = start_walk('lime_path.ahk')
+        written = open(proc._tmp, encoding='utf-8-sig').read()
+        assert proc._mark in written, 'the marker path did not survive the write'
+        os.remove(proc._tmp)
+    finally:
+        subprocess.Popen = real_popen
+        for n, fn in kept.items():
+            setattr(me, n, fn)
+        try:
+            os.rmdir(folder)
+        except OSError:
+            pass
+    print('  a walk is written even where the path is not spellable in this PC codepage')
+
+    folders = walk_folders()
+    assert walk_dir() in folders and tempfile.gettempdir() in folders, folders
+    assert len(folders) == len(set(folders)), folders
+    print('  walk scripts are swept from %d folders, including every place older builds left them' % len(folders))
+
+
+if __name__ == '__main__':
+    print('game self check:')
+    demo()

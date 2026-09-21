@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import messagebox
 import urllib.error
@@ -50,7 +51,7 @@ SMALL_BUTTON = dict(bg=SUNK, fg=TEXT, activebackground=SUNK, activeforeground=AC
                     highlightthickness=1, highlightbackground=EDGE)
 
 TITLE = 'Manas Minigame Macro'
-VERSION = '1.3.1'
+VERSION = '1.3.3'
 UPDATE_TRIES = 4                        # startup update checks, in case the network is not up yet
 UPDATE_RETRY_S = 20
 RELEASE_PAGE = 'https://github.com/ManasAarohi1/ManasMinigameMacro/releases/latest'
@@ -58,7 +59,7 @@ RELEASES = (os.environ.get('MMM_UPDATE_URL')
             or 'https://api.github.com/repos/ManasAarohi1/ManasMinigameMacro/releases/latest')
 INVITE = 'https://discord.gg/oppression'
 GAME_LINK = 'https://www.roblox.com/games/15532962292/Sols-RNG'     # opened by Start when Roblox is shut and no server link is set
-AHK_DOWNLOAD = 'https://www.autohotkey.com/download/1.1/'
+AHK_DOWNLOAD = 'https://www.autohotkey.com/'          # the main site; /download/1.1/ is a bare file listing
 ITEM_EVERY_S = {game.SC: 20 * 60, game.BR: 35 * 60}    # a Strange Controller lasts 20 minutes, a Biome Randomizer 35
 ITEM_RETRY_S = 5 * 60                   # one that could not be used is tried again this much later
 LOOP_ROUNDS = 10 ** 9                   # Continuous loop: keeps going until Stop
@@ -68,6 +69,7 @@ REJOIN_WAITS = (30, 60, 120, 300, 300)
 WATCH_EVERY = 0.5
 WAIT_BACK_S = 600                       # s to wait for Roblox to rejoin by itself when there is no link
 EQUIP_WAIT_S = 120                      # s to wait for the game before a re-equip
+ROUND_SLACK_S = 300                     # a round is ended this long past its give-up time whatever it is doing
 EQUIP_GIVE_UP = 3                       # failed re-equips in a row (one a round) before a rest
 EQUIP_REST_S = 600                      # ...this long on the normal paths, then it tries again
 CRASH_WAITS = (30, 60, 120, 300)        # s before a crashed run starts again (the last one repeats)
@@ -112,7 +114,7 @@ def device_line():
 def rolled_away(watch):
     """The aura the log shows if it is not Abyssal Hunter and has lasted AURA_BLIP_S, else None."""
     aura = watch.aura
-    if not aura or game.ABYSSAL.lower() in aura.lower() or watch.aura_for() < AURA_BLIP_S:
+    if not aura or game.is_abyssal(aura) or watch.aura_for() < AURA_BLIP_S:
         return None
     return aura
 
@@ -218,7 +220,7 @@ def post_event(webhook_url, title, description='', colour=EMBED_INFO):
 
 def append_history(biome):
     os.makedirs(os.path.dirname(game.HISTORY_FILE), exist_ok=True)
-    with open(game.HISTORY_FILE, 'a') as f:
+    with open(game.HISTORY_FILE, 'a', encoding='utf-8') as f:
         f.write(json.dumps({'ts': time.time(), 'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'biome': biome}) + '\n')
 
 
@@ -226,13 +228,13 @@ def append_history(biome):
 SWAP_BAT = '''@echo off
 set n=0
 :retry
-move /y "{new}" "{old}" >nul 2>&1 && goto done
+move /y "%MMM_NEW%" "%MMM_OLD%" >nul 2>&1 && goto done
 set /a n+=1
 if %n% geq 60 goto done
 ping -n 2 127.0.0.1 >nul
 goto retry
 :done
-start "" "{old}"
+start "" "%MMM_OLD%"
 del "%~f0"
 '''
 
@@ -282,9 +284,10 @@ def can_write(folder):
 def install(new_exe, old_exe):
     """Once this process has exited, put the new exe in place and start it."""
     bat = os.path.join(tempfile.gettempdir(), 'mmm_update_%d.bat' % os.getpid())
-    with open(bat, 'w') as f:
-        f.write(SWAP_BAT.format(new=new_exe, old=old_exe))
-    subprocess.Popen(['cmd', '/c', bat], creationflags=0x00000008 | 0x00000200, close_fds=True)
+    with open(bat, 'w', encoding='ascii') as f:     # the paths go through the environment, not into the
+        f.write(SWAP_BAT)                           # file: a batch file is read in the console's codepage,
+    env = dict(os.environ, MMM_NEW=new_exe, MMM_OLD=old_exe)    # which cannot always spell the exe's path
+    subprocess.Popen(['cmd', '/c', bat], env=env, creationflags=0x00000008 | 0x00000200, close_fds=True)
 
 
 # ================================================================ widgets
@@ -734,6 +737,7 @@ class App:
         self.mode = 'vip'
         self.slow_pc = False
         self.need_rejoin = None     # why the client has to be rejoined
+        self.round_end_by = None    # the hard end of the round being played
         self.start_again = False
         self.item_due = {}
         self.daily_mark = time.time()   # the start, or the last try at the daily rewards
@@ -1035,6 +1039,8 @@ class App:
                 return True
             self._last_hotkey[which] = now
             note('run', 'F%d pressed' % (1 if which == 'start' else 2))
+            if which == 'stop':
+                solver.ABORT = True          # the run answers this at once; the buttons follow on the UI thread
             self.updates.put({'action': which})
         except Exception:
             pass
@@ -1120,7 +1126,7 @@ class App:
             return
         except Exception as e:
             self._oops(type(e), e, None)
-        self.root.after(100, self._pump)
+        self.root.after(25, self._pump)       # how long a keypress waits to be acted on
 
     def _apply(self, kw):
         if 'phase' in kw:
@@ -1137,6 +1143,7 @@ class App:
             self.start_again = True                         # F1 while the last run is still stopping: start after it
             self.phase('stopping - starting again after it', DIM)
         elif kw.get('action') == 'start' and not self.running:
+            self.phase('starting', GOOD)                    # so a press is visibly taken, before any slow check
             self.start()
         elif kw.get('action') == 'stop' and self.running:
             self.stop()
@@ -1295,7 +1302,7 @@ class App:
         self._set(phase='%s%s' % (title, ' - ' + detail if detail else ''))
 
     def offer_ahk_install(self, why):
-        if messagebox.askyesno(TITLE, why + '\n\nOpen the AutoHotkey 1.1 download page?\n\nInstall it, then press Start again.'):
+        if messagebox.askyesno(TITLE, why + '\n\nOpen autohotkey.com?\n\nInstall AutoHotkey 1.1 (not 2.0), then press Start again.'):
             webbrowser.open(AHK_DOWNLOAD)
 
     def whats_missing(self):
@@ -1342,7 +1349,7 @@ class App:
                     except Exception:
                         pass
                     why = '%s: %s' % (type(e).__name__, e)
-                    note('crash', why)
+                    note('crash', '%s\n%s' % (why, traceback.format_exc()[-1500:]))
                     if solver.ABORT:
                         self.tell('Macro crashed', why, EMBED_BAD)
                         return
@@ -1374,7 +1381,7 @@ class App:
             k += 1
             if solver.ABORT:
                 return False
-            if self.reconnect_on and not self.need_rejoin and not game.roblox_running():
+            if self.reconnect_on and not self.need_rejoin and game.roblox_gone():
                 self.need_rejoin = 'Roblox is not running'
             if self.need_rejoin and not self.reconnect():
                 return False
@@ -1384,6 +1391,11 @@ class App:
                 why = 'no dialogue'
             except Exception as e:
                 why = '%s: %s' % (type(e).__name__, e)
+                note('crash', 'in the entry:\n%s' % traceback.format_exc()[-1500:])   # where, for the next report
+                try:
+                    game.stop_all()        # a throw part way through a walk leaves its keys down
+                except Exception:
+                    pass
             misses += 1
             # a missed entry in abyssal mode may mean the aura is gone: re-equip only if the log shows another one
             # (never while it shows Abyssal Hunter: Equip on an equipped aura takes it off)
@@ -1404,7 +1416,7 @@ class App:
 
     def play(self, n, limit):
         solver.ABORT = False
-        game.ALIGNED = False
+        game.fresh_session()
         game.set_pace(2.0 if self.slow_pc else 1.0)
         self._set(phase='reading the path', colour=DIM)
         solver.set_mode(self.mode)
@@ -1414,7 +1426,7 @@ class App:
         self.need_rejoin = None
         self.watch = None
         self.aura_lost = None
-        self.equip_fails, self.equip_after = 0, 0.0
+        self.equip_fails, self.equip_after, self.slot_bump = 0, 0.0, 0
         self.check_aura = self.abyssal_on
         solver.PAUSE = self if self.abyssal_on else None
         if self.reconnect_on or self.abyssal_on:
@@ -1429,7 +1441,7 @@ class App:
                 self.need_rejoin = 'Roblox is not running'
             if self.abyssal_on and not self.need_rejoin and rolled_away(self.watch):
                 self.aura_lost = rolled_away(self.watch)
-            threading.Thread(target=self._watch_connection, daemon=True).start()
+        threading.Thread(target=self._watch_connection, daemon=True).start()
 
         if not self.ready_to_play():
             solver.PAUSE = None
@@ -1470,17 +1482,22 @@ class App:
                 self.tell('Could not get into a round', 'stopped after %d rounds' % (i - 1), EMBED_BAD)
                 break
             played += 1
-            solver.start_clock(limit)
+            ticket = game.TICKET_AT
+            hunted = ticket if ticket is not None and ticket > began else time.perf_counter()
+            solver.start_clock(limit)                     # the give-up time counts once the round is seen on
+            self.round_end_by = time.perf_counter() + limit + solver.NEAR_EXTRA_S + ROUND_SLACK_S if limit else None
             self._set(phase='%s - hunting' % head)
             try:
                 got = solver.play_round(bot)
             except Exception as e:
                 self.tell('Round %d failed' % i, '%s: %s' % (type(e).__name__, e), EMBED_BAD)
                 got = False
-            spent = time.perf_counter() - began
+            self.round_end_by = None
+            spent = time.perf_counter() - hunted          # the round's time counts from the ticket press
             lost = self.need_rejoin
             swapped = ('a roll replaced Abyssal Hunter with %s' % self.aura_lost) if self.aura_lost else None
-            ran_out = solver.out_of_time() and not solver.ABORT and not lost and not swapped
+            ran_out = (solver.DEADLINE is not None and time.perf_counter() >= solver.DEADLINE
+                       and not solver.ABORT and not lost and not swapped)
             solver.clear_deadline()
             note('round', 'round %d %s after %.1f s' % (i, 'COLLECTED' if got else 'not collected', spent))
             if not solver.ABORT:     # a round you stopped yourself does not count
@@ -1539,6 +1556,10 @@ class App:
                         pass
                 if self.abyssal_on and self.aura_lost is None and rolled_away(watch):
                     self.aura_lost = rolled_away(watch)
+            end_by = self.round_end_by
+            if end_by is not None and time.perf_counter() > end_by and not solver.CUT:
+                note('round', 'more than %d s past the give-up time - ending the round' % ROUND_SLACK_S)
+                solver.cut_short()
             time.sleep(WATCH_EVERY)
 
     def connected(self):
@@ -1551,6 +1572,13 @@ class App:
         """Roblox open and connected. Play is only looked for after the macro itself rejoins."""
         watch = self.watch or game.Watch()
         why = watch.trouble(quiet_s=float('inf'))
+        if why and game.roblox_running() and game.find_play() is None:
+            # The log was being written long before the macro was started, so a disconnect line in
+            # it can be from a session that was rejoined hours ago. The client is up and not sitting
+            # on the title screen, which means it is in a game: play, instead of waiting for a
+            # rejoin that already happened while nothing on screen says why.
+            note('run', 'the log says "%s", but the client is in a game: starting anyway' % why)
+            why = None
         if why:
             self.need_rejoin = why
             if not self.reconnect():
@@ -1642,7 +1670,7 @@ class App:
             if self.watch.aura is not None or time.time() >= end:
                 break
             time.sleep(0.5)
-        return game.ABYSSAL.lower() in (self.watch.aura or '').lower()
+        return game.is_abyssal(self.watch.aura)
 
     def speed_for_aura(self):
         """VIP speed is set but the log shows Abyssal Hunter on: it walks half as fast again. Only said in the
@@ -1653,7 +1681,7 @@ class App:
             found = game.last_aura()
         except Exception:
             return
-        if found and game.ABYSSAL.lower() in found[0].lower():
+        if found and game.is_abyssal(found[0]):
             note('run', 'the log shows %s but the speed is set to VIP: the walks will overshoot' % found[0])
 
     def check_abyssal(self):
@@ -1662,7 +1690,7 @@ class App:
             return True
         self.watch.poll()
         aura, age = self.watch.aura, self.watch.aura_for()
-        if aura and game.ABYSSAL.lower() not in aura.lower() and age < AURA_BLIP_S:
+        if aura and not game.is_abyssal(aura) and age < AURA_BLIP_S:
             if not self.nap(AURA_BLIP_S - age):
                 return False
             self.watch.poll()
@@ -1697,7 +1725,7 @@ class App:
             if self.watch is None:
                 return False
             self.watch.poll()
-            return game.ABYSSAL.lower() in (self.watch.aura or '').lower()
+            return game.is_abyssal(self.watch.aura)
 
         if wearing():
             self.aura_lost, self.equip_fails = None, 0
@@ -1730,8 +1758,10 @@ class App:
                 if attempt and route == 'clicks' and tried == 'clicks':
                     route = 'menu keys'                 # the clicks did not take: the other way, which reads the screen
                 tried = route
+                slot, before = min(game.AURA_ROW, game.abyssal_slot() + self.slot_bump), self.watch.aura
                 try:
-                    done = game.equip_by_clicks(stop=lambda: solver.ABORT) if route == 'clicks' else game.equip_by_keys(say=lambda m: note('abyssal', m))
+                    done = (game.equip_by_clicks(stop=lambda: solver.ABORT) if route == 'clicks'
+                            else game.equip_by_keys(say=lambda m: note('abyssal', m), slot=slot))
                 except Exception as e:
                     done = False
                     note('abyssal', 'attempt %d by %s crashed: %s: %s' % (attempt + 1, route, type(e).__name__, e))
@@ -1742,7 +1772,7 @@ class App:
                 end = time.time() + 12.0
                 while time.time() < end and not solver.ABORT:
                     self.watch.poll()
-                    if game.ABYSSAL.lower() in (self.watch.aura or '').lower():
+                    if game.is_abyssal(self.watch.aura):
                         self.aura_lost, self.equip_fails = None, 0
                         solver.set_mode(self.mode)
                         self.tell('Abyssal Hunter re-equipped', '', EMBED_GOOD)
@@ -1750,6 +1780,10 @@ class App:
                         return True
                     time.sleep(0.5)
                 note('abyssal', 'attempt %d: the log still shows %s after 12 s' % (attempt + 1, self.watch.aura))
+                if route == 'menu keys' and slot < game.AURA_ROW and (
+                        game.abyssal_variant(self.watch.aura) or game.abyssal_variant(before)):
+                    self.slot_bump += 1         # that slot holds a look-alike (Equip on it put it on, or took it off)
+                    note('abyssal', 'slot %d is not Abyssal Hunter itself - trying slot %d from now on' % (slot, slot + 1))
                 game.screenshot('equip_failed_%d.png' % (attempt + 1))      # what was on screen when it did not take
                 self.close_guis()
             self.equip_fails += 1
